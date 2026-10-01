@@ -53,7 +53,7 @@ typedef struct {
     // 用量页控件
     lv_obj_t *week_bar, *week_pct, *week_reset;
     lv_obj_t *h5_bar, *h5_pct, *h5_reset;
-    lv_obj_t *mcp_bar, *mcp_val, *mcp_label, *foot;
+    lv_obj_t *mcp_val, *mcp_label, *foot;
     // 网络页控件
     lv_obj_t *net_lines;
 } ui_t;
@@ -197,14 +197,13 @@ static void build_usage_page(lv_obj_t *page)
     style_label(s_ui.mcp_val, &s_font24, COL_TEXT);
     lv_obj_set_pos(s_ui.mcp_val, 140, 198);
     lv_label_set_text(s_ui.mcp_val, "--");
-    s_ui.mcp_bar = make_bar(page, 14, 234, 212, 12);
-
-    // 状态行:套餐 + 刷新倒计时/错误(超长截尾)。
+    // 行 3 无进度条(剩余重置次数没有百分比语义)。
+    // 状态行:套餐 + 刷新倒计时/错误(超长截尾),占用原进度条位置。
     s_ui.foot = lv_label_create(page);
     style_label(s_ui.foot, &s_font16, COL_DIM);
     lv_obj_set_width(s_ui.foot, 216);
     lv_label_set_long_mode(s_ui.foot, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(s_ui.foot, 14, 258);
+    lv_obj_set_pos(s_ui.foot, 14, 240);
     lv_label_set_text(s_ui.foot, "等待数据…");
 }
 
@@ -302,16 +301,13 @@ static void update_usage_page(const glm_usage_t *u)
     if (u->mcp_total > 0) {
         lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
         lv_label_set_text_fmt(s_ui.mcp_val, "%d/%d", u->mcp_used, u->mcp_total);
-        set_bar_pct(s_ui.mcp_bar, u->mcp_used * 100 / u->mcp_total);
     } else if (u->week_resets_left >= 0 && u->five_hour_resets_left >= 0) {
         lv_label_set_text(s_ui.mcp_label, "剩余重置");
         lv_label_set_text_fmt(s_ui.mcp_val, "周%d 5h%d",
                               u->week_resets_left, u->five_hour_resets_left);
-        set_bar_pct(s_ui.mcp_bar, -1); // 次数没有百分比语义,条置空
     } else {
         lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
         lv_label_set_text(s_ui.mcp_val, "--");
-        set_bar_pct(s_ui.mcp_bar, -1);
     }
 }
 
