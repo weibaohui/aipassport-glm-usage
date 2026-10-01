@@ -75,8 +75,6 @@ typedef struct {
     lv_obj_t *week_bar, *week_pct, *week_reset;
     lv_obj_t *h5_bar, *h5_pct, *h5_reset;
     lv_obj_t *mcp_val, *mcp_label, *foot;
-    // 网络页控件
-    lv_obj_t *net_lines;
     // 配网横幅(仅主页面构建)
     lv_obj_t *portal;
     // 菜单/子页行控件(高亮刷新用)
@@ -86,7 +84,6 @@ typedef struct {
 
 static ui_t s_ui;
 static ui_state_t s_state = UI_MAIN; // UI 状态(input 持锁写,轮询读;enum 对齐访问)
-static int s_page;                   // 主页面:0=用量 1=网络
 static int s_menu_sel;               // 菜单光标
 static int s_opt_sel;                // 子页选项光标
 static int s_wifi_sel;               // WiFi 页光标
@@ -117,8 +114,9 @@ static const char *MENU_LBL[] = {
     LV_SYMBOL_WIFI "  WiFi 管理",
     LV_SYMBOL_LIST "  设备信息",
     LV_SYMBOL_HOME "  配网",
+    LV_SYMBOL_LEFT "  返回",
 };
-#define MENU_N 5
+#define MENU_N 6
 
 // ---------------------------------------------------------------- 工具
 
@@ -322,21 +320,11 @@ static void build_usage_page(lv_obj_t *page)
     lv_label_set_text(s_ui.foot, "等待数据…");
 }
 
-static void build_net_page(lv_obj_t *page)
-{
-    s_ui.net_lines = lv_label_create(page);
-    style_label(s_ui.net_lines, &s_font16, COL_TEXT);
-    lv_obj_set_pos(s_ui.net_lines, 14, 50);
-    lv_obj_set_width(s_ui.net_lines, 212);
-    lv_label_set_long_mode(s_ui.net_lines, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(s_ui.net_lines, "加载中…");
-}
-
 static void build_menu(lv_obj_t *page)
 {
     for (int i = 0; i < MENU_N; i++) {
         bool cursor = (i == s_menu_sel);
-        lv_obj_t *row = make_row(page, 52 + i * 44, cursor, " ", MENU_LBL[i]);
+        lv_obj_t *row = make_row(page, 48 + i * 40, cursor, " ", MENU_LBL[i]);
         // 右侧箭头:提示"OK 进入"。
         lv_obj_t *arrow = lv_label_create(row);
         lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
@@ -347,10 +335,19 @@ static void build_menu(lv_obj_t *page)
     }
     s_ui.row_count = MENU_N;
 
-    lv_obj_t *hint = lv_label_create(page);
-    style_label(hint, &s_font16, COL_DIM);
-    lv_label_set_text(hint, "OK 进入 · 长按返回");
-    lv_obj_set_pos(hint, 14, 284);
+    // 底部管理地址:联网时显示局域网访问入口(在线即可达,免开网页找 IP)。
+    app_net_status_t st;
+    app_net_get_status(&st);
+    lv_obj_t *url = lv_label_create(page);
+    style_label(url, &s_font16, COL_DIM);
+    lv_obj_set_width(url, 216);
+    lv_label_set_long_mode(url, LV_LABEL_LONG_DOT);
+    if (st.state == APP_NET_ONLINE && st.ip[0]) {
+        lv_label_set_text_fmt(url, "管理地址 http://%s", st.ip);
+    } else {
+        lv_label_set_text(url, "管理地址:联网后可用");
+    }
+    lv_obj_set_pos(url, 12, 292);
 }
 
 // 子页选项列表:cursor 高亮光标;当前已存值行前带绿色 ✓。
@@ -362,15 +359,13 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
         bool is_current = (opts[i] == current);
         char text[40];
         snprintf(text, sizeof(text), "%s %s", is_current ? LV_SYMBOL_OK : " ", lbls[i]);
-        s_ui.rows[i] = make_row(page, 50 + i * 40, cursor,
+        s_ui.rows[i] = make_row(page, 46 + i * 36, cursor,
                                 cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
-    s_ui.row_count = n;
-
-    lv_obj_t *hint = lv_label_create(page);
-    style_label(hint, &s_font16, COL_DIM);
-    lv_label_set_text(hint, "OK 保存 · 长按返回");
-    lv_obj_set_pos(hint, 14, 298);
+    // 返回行:最后一项,OK 即回菜单(替代"长按返回")。
+    s_ui.rows[n] = make_row(page, 46 + n * 36, s_opt_sel == n,
+                            LV_SYMBOL_LEFT, "返回");
+    s_ui.row_count = n + 1;
 }
 
 static void build_wifi_page(lv_obj_t *page)
@@ -391,8 +386,9 @@ static void build_wifi_page(lv_obj_t *page)
     if (s_wifi_cache_n == 0) {
         lv_obj_t *empty = lv_label_create(page);
         style_label(empty, &s_font16, COL_DIM);
-        lv_label_set_text(empty, "暂无已存热点\n请通过网页配网添加");
+        lv_label_set_text(empty, "暂无已存热点\n可在网页配网时添加");
         lv_obj_set_pos(empty, 14, 70);
+        s_ui.row_count = 0;
     } else {
         app_net_status_t st;
         app_net_get_status(&st);
@@ -403,15 +399,14 @@ static void build_wifi_page(lv_obj_t *page)
             char text[APP_NETLIST_SSID_MAX + 8];
             snprintf(text, sizeof(text), "%s %s",
                      current ? LV_SYMBOL_OK : " ", s_wifi_cache[i]);
-            make_row(page, 52 + i * 44, cursor,
+            make_row(page, 46 + i * 36, cursor,
                      cursor ? LV_SYMBOL_RIGHT : " ", text);
         }
+        // 返回行:OK 即回菜单。
+        make_row(page, 46 + shown * 36, s_wifi_sel >= shown,
+                 LV_SYMBOL_LEFT, "返回");
+        s_ui.row_count = shown + 1;
     }
-
-    lv_obj_t *hint = lv_label_create(page);
-    style_label(hint, &s_font16, COL_DIM);
-    lv_label_set_text(hint, s_wifi_cache_n ? "OK 连接 · 长按返回" : "长按返回");
-    lv_obj_set_pos(hint, 14, 282);
 }
 
 // 配网子页:开关 + 热点名/管理地址/连接数。
@@ -475,34 +470,36 @@ static void build_info_page(lv_obj_t *page)
     app_net_get_status(&st);
     refresh_key_mask();
     char org[64] = { 0 }, proj[64] = { 0 };
-    bool team = app_storage_load_org(org, sizeof(org)) &&
-                app_storage_load_project(proj, sizeof(proj));
+    bool has_org = app_storage_load_org(org, sizeof(org));
+    bool has_proj = app_storage_load_project(proj, sizeof(proj));
     uint16_t period_s = GLM_API_PERIOD_S, soff = 300;
     app_storage_load_period(&period_s);
     app_storage_load_screen_off(&soff);
 
-    const char *team_str = team ? "已配置" : "未配置";
     char soff_str[16];
     snprintf(soff_str, sizeof(soff_str), soff == 0 ? "永不" : "%u 分钟",
              (unsigned)(soff / 60));
 
+    char url[48];
+    snprintf(url, sizeof(url), "%s", st.ip[0] ? st.ip : "联网后可用");
+
     const struct { const char *k; char v[72]; } rows[] = {
         { "固件", { 0 } },
-        { "IP", { 0 } },
-        { "信号", { 0 } },
+        { "管理地址", { 0 } },
         { "API Key", { 0 } },
-        { "团队", { 0 } },
+        { "组织", { 0 } },
+        { "项目", { 0 } },
         { "刷新 / 熄屏", { 0 } },
     };
     snprintf((char *)rows[0].v, sizeof(rows[0].v), "%s", app->version);
-    snprintf((char *)rows[1].v, sizeof(rows[1].v), "%s", st.ip[0] ? st.ip : "未连接");
-    snprintf((char *)rows[2].v, sizeof(rows[2].v), "%d dBm", st.rssi);
-    snprintf((char *)rows[3].v, sizeof(rows[3].v), "%s", s_key_mask);
-    snprintf((char *)rows[4].v, sizeof(rows[4].v), "%s", team_str);
+    snprintf((char *)rows[1].v, sizeof(rows[1].v), "http://%s", url);
+    snprintf((char *)rows[2].v, sizeof(rows[2].v), "%s", s_key_mask);
+    snprintf((char *)rows[3].v, sizeof(rows[3].v), "%s", has_org ? "已配置" : "未配置");
+    snprintf((char *)rows[4].v, sizeof(rows[4].v), "%s", has_proj ? "已配置" : "未配置");
     snprintf((char *)rows[5].v, sizeof(rows[5].v), "%u 分钟 / %s",
              (unsigned)(period_s / 60), soff_str);
 
-    int y = 56;
+    int y = 54;
     for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
         lv_obj_t *k = lv_label_create(page);
         style_label(k, &s_font16, COL_DIM);
@@ -511,17 +508,15 @@ static void build_info_page(lv_obj_t *page)
 
         lv_obj_t *v = lv_label_create(page);
         style_label(v, &s_font16, COL_TEXT);
-        lv_obj_set_width(v, 130);
+        lv_obj_set_width(v, 140);
         lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
         lv_label_set_text(v, rows[i].v);
-        lv_obj_set_pos(v, 100, y);
-        y += 30;
+        lv_obj_set_pos(v, 92, y);
+        y += 27;
     }
 
-    lv_obj_t *hint = lv_label_create(page);
-    style_label(hint, &s_font16, COL_DIM);
-    lv_label_set_text(hint, "OK 返回");
-    lv_obj_set_pos(hint, 14, 254);
+    // 返回行:OK 即回菜单。
+    make_row(page, y + 4, true, LV_SYMBOL_LEFT, "返回");
 }
 
 // 重建当前状态页:删除旧容器后按 s_state 重新构建。持锁调用。
@@ -537,33 +532,9 @@ static void rebuild_page(void)
 
     switch (s_state) {
     case UI_MAIN:
-        if (s_page == 0) {
-            build_top_bar(s_ui.page, "GLM 用量");
-            build_usage_page(s_ui.page);
-        } else {
-            refresh_key_mask();
-            // 配置摘要(组织/项目/刷新/熄屏),网络页构建时读一次 NVS。
-            char org[64] = { 0 }, proj[64] = { 0 };
-            bool has_org = app_storage_load_org(org, sizeof(org));
-            bool has_proj = app_storage_load_project(proj, sizeof(proj));
-            uint16_t period_s = GLM_API_PERIOD_S, soff = 300;
-            app_storage_load_period(&period_s);
-            app_storage_load_screen_off(&soff);
-            snprintf(s_saved_list_text, sizeof(s_saved_list_text),
-                     "组织:%s\n项目:%s\n刷新:%u 分钟\n熄屏:%s\n",
-                     has_org ? "已配置" : "未配置",
-                     has_proj ? "已配置" : "未配置",
-                     (unsigned)(period_s / 60),
-                     soff == 0 ? "永不" : "");
-            if (soff != 0) {
-                char tail[24];
-                snprintf(tail, sizeof(tail), "%u 分钟\n", (unsigned)(soff / 60));
-                strncat(s_saved_list_text, tail, sizeof(s_saved_list_text) - strlen(s_saved_list_text) - 1);
-            }
-            build_top_bar(s_ui.page, "网络");
-            build_net_page(s_ui.page);
-        }
-        // 配网横幅:仅主页面有(菜单里不需要)。
+        build_top_bar(s_ui.page, "GLM 用量");
+        build_usage_page(s_ui.page);
+        // 配网横幅:仅主页面有。
         s_ui.portal = lv_label_create(s_ui.page);
         style_label(s_ui.portal, &s_font16, COL_WARN);
         lv_obj_set_width(s_ui.portal, 216);
@@ -715,44 +686,6 @@ static void update_foot(const glm_usage_t *u, glm_err_t err, bool last_ok,
     lv_obj_set_style_text_color(s_ui.foot, lv_color_hex(COL_DIM), 0);
 }
 
-static void update_net_page(void)
-{
-    app_net_status_t st;
-    app_net_get_status(&st);
-    char text[512];
-    size_t used = 0;
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "WiFi ");
-    switch (st.state) {
-    case APP_NET_ONLINE:
-        used += (size_t)snprintf(text + used, sizeof(text) - used,
-                                 "已连接 %s(%d dBm)\nIP %s\n\n",
-                                 st.cur_ssid, st.rssi, st.ip);
-        break;
-    case APP_NET_CONNECTING:
-        used += (size_t)snprintf(text + used, sizeof(text) - used,
-                                 "正在连接 %s…\n\n", st.cur_ssid);
-        break;
-    case APP_NET_OFFLINE_RETRY:
-        used += (size_t)snprintf(text + used, sizeof(text) - used, "连接失败,自动重试中…\n\n");
-        break;
-    case APP_NET_SCANNING:
-        used += (size_t)snprintf(text + used, sizeof(text) - used, "扫描中…\n\n");
-        break;
-    default:
-        used += (size_t)snprintf(text + used, sizeof(text) - used, "未连接\n\n");
-        break;
-    }
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "API Key:%s\n", s_key_mask);
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "%s", s_saved_list_text);
-    // 联网后管理页走局域网 IP(同一套配网页:改 Key/选项目/改热点都用它)。
-    if (st.state == APP_NET_ONLINE && st.ip[0]) {
-        used += (size_t)snprintf(text + used, sizeof(text) - used,
-                                 "管理页 http://%s\n", st.ip);
-    }
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "长按OK:设置菜单");
-    lv_label_set_text(s_ui.net_lines, text);
-}
-
 // ---------------------------------------------------------------- 定时器
 
 static void poll_timer_cb(lv_timer_t *timer)
@@ -774,7 +707,7 @@ static void poll_timer_cb(lv_timer_t *timer)
     }
 
     // 2) 页面动态内容(仅主页面;菜单/子页为静态构建)。
-    if (s_state == UI_MAIN && s_page == 0 && s_ui.week_bar) {
+    if (s_state == UI_MAIN && s_ui.week_bar) {
         glm_usage_t u;
         glm_err_t err;
         int64_t fetch_epoch_s;
@@ -782,8 +715,6 @@ static void poll_timer_cb(lv_timer_t *timer)
         app_glm_client_get_snapshot(&u, &err, &fetch_epoch_s, &last_ok);
         update_usage_page(&u);
         update_foot(&u, err, last_ok, fetch_epoch_s);
-    } else if (s_state == UI_MAIN && s_page == 1 && s_ui.net_lines) {
-        update_net_page();
     }
 
     // 3) 配网横幅:仅主页面,AP 开着未联网时显示。
@@ -850,7 +781,6 @@ void app_ui_on_key(int btn, int ev)
     // 副作用收集:持锁阶段只改 UI/状态,解锁后执行。
     bool do_sleep = false;
     bool do_refresh = false;
-    bool do_portal = false;
 
     if (!bsp_lvgl_lock(300)) {
         return; // 锁超时(极少见):丢弃本次按键,下一键恢复
@@ -866,10 +796,9 @@ void app_ui_on_key(int btn, int ev)
         } else if (btn == (int)BSP_BTN_OK && ev == 0) {
             do_sleep = true; // 单击 OK:手动熄屏;唤醒走最前面的分支
         } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
-            if (s_page == 0) do_refresh = true;
-            else { s_page = 0; rebuild_page(); }
+            do_refresh = true; // 用量页=手动刷新
         } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
-            s_page = 1;
+            s_state = UI_MENU;
             rebuild_page();
         }
         break;
@@ -885,11 +814,17 @@ void app_ui_on_key(int btn, int ev)
             s_menu_sel = (s_menu_sel + 1) % MENU_N;
             refresh_rows_cursor(s_menu_sel);
         } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
-            s_opt_sel = 0;
-            s_state = (s_menu_sel == 0) ? UI_SUB_REFRESH
-                    : (s_menu_sel == 1) ? UI_SUB_SOFF
-                    : (s_menu_sel == 2) ? UI_SUB_WIFI
-                    : (s_menu_sel == 3) ? UI_SUB_INFO : UI_SUB_PROV;
+            if (s_menu_sel == 5) {
+                // 返回行
+                s_state = UI_MAIN;
+            } else {
+                s_opt_sel = 0;
+                s_wifi_sel = 0;
+                s_state = (s_menu_sel == 0) ? UI_SUB_REFRESH
+                        : (s_menu_sel == 1) ? UI_SUB_SOFF
+                        : (s_menu_sel == 2) ? UI_SUB_WIFI
+                        : (s_menu_sel == 3) ? UI_SUB_INFO : UI_SUB_PROV;
+            }
             rebuild_page();
         }
         break;
@@ -902,12 +837,18 @@ void app_ui_on_key(int btn, int ev)
             s_state = UI_MENU;
             rebuild_page();
         } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
-            s_opt_sel = (s_opt_sel + n - 1) % n;
+            s_opt_sel = (s_opt_sel + n) % (n + 1); // 最后一项是返回行
             refresh_rows_cursor(s_opt_sel);
         } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
-            s_opt_sel = (s_opt_sel + 1) % n;
+            s_opt_sel = (s_opt_sel + 1) % (n + 1);
             refresh_rows_cursor(s_opt_sel);
         } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
+            if (s_opt_sel == n) {
+                // 返回行:回菜单。
+                s_state = UI_MENU;
+                rebuild_page();
+                break;
+            }
             uint16_t v = opts[s_opt_sel];
             bool ok = (s_state == UI_SUB_REFRESH) ? app_storage_save_period(v)
                                                   : app_storage_save_screen_off(v);
@@ -931,9 +872,7 @@ void app_ui_on_key(int btn, int ev)
             rebuild_page();
         } else if (ev == 0 && btn == (int)BSP_BTN_OK && s_wifi_cache_n > 0) {
             app_net_connect_ssid(s_wifi_cache[s_wifi_sel]);
-            s_state = UI_MAIN;
-            s_page = 1; // 网络页能看到连接进度
-            rebuild_page();
+            rebuild_page(); // 重建后 ✓ 标记移到新连接项
             show_toast("正在连接,请稍候…");
         }
         break;
@@ -965,7 +904,6 @@ void app_ui_on_key(int btn, int ev)
     // ---- 副作用(锁外) ----
     if (do_sleep) screen_sleep();
     if (do_refresh) app_glm_client_refresh_now();
-    if (do_portal) app_net_start_portal();
 }
 
 void app_ui_portal_tick(void)
@@ -1010,7 +948,6 @@ void app_ui_init(void)
     lv_screen_load(s_scr);
 
     s_state = UI_MAIN;
-    s_page = 0;
     s_menu_sel = 0;
     rebuild_page();
     s_last_input_ms = lv_tick_get();
