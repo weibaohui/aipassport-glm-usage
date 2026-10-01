@@ -1,6 +1,7 @@
 // main/app_storage.c —— NVS 持久化实现,键与语义见 app_storage.h。
 #include "app_storage.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -64,11 +65,20 @@ bool app_storage_load_netlist(app_netlist_t *list)
 {
     if (!list) return false;
     app_netlist_reset(list);
-    // 1.1KB 栈缓冲:本函数会被 LVGL 轮询与门户 HTTP 两个任务并发调用,
-    // 不能用 static(非线程安全);两个调用方栈均在 4KB 以上,可承受。
-    char blob[APP_NETLIST_BLOB_MAX];
-    if (!nvs_get_str_all("nets", blob, sizeof(blob))) return false;
-    if (!app_netlist_deserialize(blob, list)) {
+    // 1.1KB 缓冲走堆而不是栈:栈版本曾把 3KB 的按键任务打溢出(进 WiFi 管理
+    // 页即重启);堆分配每次独立,天然线程安全,失败安全降级为"无记录"。
+    char *blob = malloc(APP_NETLIST_BLOB_MAX);
+    if (!blob) {
+        ESP_LOGE(TAG, "无内存读热点列表");
+        return false;
+    }
+    if (!nvs_get_str_all("nets", blob, APP_NETLIST_BLOB_MAX)) {
+        free(blob);
+        return false;
+    }
+    bool ok = app_netlist_deserialize(blob, list);
+    free(blob);
+    if (!ok) {
         ESP_LOGW(TAG, "已存热点列表损坏,已丢弃");
         app_netlist_reset(list);
         return false;
@@ -84,12 +94,16 @@ bool app_storage_load_netlist(app_netlist_t *list)
 bool app_storage_save_netlist(const app_netlist_t *list)
 {
     if (!list) return false;
-    char blob[APP_NETLIST_BLOB_MAX];
-    if (!app_netlist_serialize(list, blob, sizeof(blob))) {
+    char *blob = malloc(APP_NETLIST_BLOB_MAX); // 同 load:堆缓冲防调用方栈溢出
+    if (!blob) return false;
+    if (!app_netlist_serialize(list, blob, APP_NETLIST_BLOB_MAX)) {
         ESP_LOGE(TAG, "热点列表序列化失败(不应发生)");
+        free(blob);
         return false;
     }
-    if (!nvs_set_str_all("nets", blob)) return false;
+    bool ok = nvs_set_str_all("nets", blob);
+    free(blob);
+    if (!ok) return false;
     const char *sel = (list->selected >= 0 && list->selected < (int)list->count)
                           ? list->items[list->selected].ssid : "";
     return nvs_set_str_all("sel_ssid", sel);
