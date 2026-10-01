@@ -132,6 +132,30 @@ bool app_storage_load_period(uint16_t *period_s)
     return true;
 }
 
+bool app_storage_load_screen_off(uint16_t *screen_off_s)
+{
+    if (!screen_off_s) return false;
+    *screen_off_s = 300;
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint16_t v = 0;
+    esp_err_t err = nvs_get_u16(h, "scr_off_s", &v);
+    nvs_close(h);
+    if (err != ESP_OK) return false;
+    *screen_off_s = v;
+    return true;
+}
+
+bool app_storage_save_screen_off(uint16_t screen_off_s)
+{
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u16(h, "scr_off_s", screen_off_s);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err == ESP_OK;
+}
+
 bool app_storage_save_period(uint16_t period_s)
 {
     nvs_handle_t h;

@@ -41,6 +41,11 @@ bool app_storage_load_project(char *proj_buf, size_t proj_len);
 // 保存组织/项目 ID;两个都传空串即清除。返回 true 表示写入成功。
 bool app_storage_save_org_project(const char *org_id, const char *project_id);
 
+// 熄屏超时(秒):静息超过该时长自动关背光并让面板睡眠。合法值:
+// 60/300/600/1800/0(0=永不熄屏);未保存返回 false,调用方用默认 300。
+bool app_storage_load_screen_off(uint16_t *screen_off_s);
+bool app_storage_save_screen_off(uint16_t screen_off_s);
+
 // 刷新周期(秒)。合法值:60/300/600/900/1800/3600(门户下拉的六个选项);
 // 未保存返回 false,调用方用默认 60。保存前不校验,调用方负责只传合法值。
 bool app_storage_load_period(uint16_t *period_s);

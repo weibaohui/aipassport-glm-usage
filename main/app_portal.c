@@ -94,6 +94,9 @@ static esp_err_t handler_status(httpd_req_t *req)
     uint16_t period_s = GLM_API_PERIOD_S;
     app_storage_load_period(&period_s);
     cJSON_AddNumberToObject(root, "period_s", period_s);
+    uint16_t soff = 300;
+    app_storage_load_screen_off(&soff);
+    cJSON_AddNumberToObject(root, "screen_off_s", soff);
     // 用户要求全部回显:Key 也带回(管理页在用户自己的局域网内,可接受)。
     char key_echo[APP_STORAGE_API_KEY_MAX];
     cJSON_AddStringToObject(root, "key",
@@ -236,6 +239,21 @@ static esp_err_t handler_key(httpd_req_t *req)
             return ESP_FAIL;
         }
     }
+    // 熄屏超时:0=永不;其余四档同款校验;缺省不改动。
+    cJSON *soff = cJSON_GetObjectItemCaseSensitive(root, "screen_off");
+    static const uint16_t soff_allowed[] = { 0, 60, 300, 600, 900, 1800 };
+    if (cJSON_IsNumber(soff)) {
+        uint16_t v = (uint16_t)soff->valueint;
+        bool legal = false;
+        for (size_t i = 0; i < sizeof(soff_allowed) / sizeof(soff_allowed[0]); i++)
+            if (v == soff_allowed[i]) legal = true;
+        if (legal) ok = ok && app_storage_save_screen_off(v);
+        else {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "screen_off invalid");
+            return ESP_FAIL;
+        }
+    }
     // Key 为空串 = 不改动已存的 Key(用于只改团队上下文/周期);非空才覆盖。
     if (key->valuestring[0] != '\0') ok = ok && app_storage_save_api_key(key->valuestring);
     ok = ok && app_storage_save_org_project(org_s, proj_s);
@@ -344,6 +362,113 @@ static esp_err_t handler_discover(httpd_req_t *req)
     }
     free(out);
     return ret;
+}
+
+// 导出全部配置为 JSON(含 WiFi 密码与 API Key —— 本就是用户自己的设备与
+// 网络,门户只在设备自身网络可达;导出文件请用户自行保管)。格式:
+//   {"v":1,"api_key":…,"org":…,"project":…,"period_s":…,"screen_off_s":…,
+//    "networks":[{"ssid":…,"pwd":…}],"selected":…}
+static esp_err_t handler_export(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    cJSON_AddNumberToObject(root, "v", 1);
+
+    char key[APP_STORAGE_API_KEY_MAX];
+    cJSON_AddStringToObject(root, "api_key",
+                            app_storage_load_api_key(key, sizeof(key)) ? key : "");
+    char org[64] = { 0 }, proj[64] = { 0 };
+    app_storage_load_org(org, sizeof(org));
+    app_storage_load_project(proj, sizeof(proj));
+    cJSON_AddStringToObject(root, "org", org);
+    cJSON_AddStringToObject(root, "project", proj);
+    uint16_t period_s = GLM_API_PERIOD_S, soff = 300;
+    app_storage_load_period(&period_s);
+    app_storage_load_screen_off(&soff);
+    cJSON_AddNumberToObject(root, "period_s", period_s);
+    cJSON_AddNumberToObject(root, "screen_off_s", soff);
+
+    app_netlist_t list;
+    bool have = app_storage_load_netlist(&list);
+    cJSON_AddNumberToObject(root, "count", have ? list.count : 0);
+    cJSON *nets = cJSON_AddArrayToObject(root, "networks");
+    const char *selected = "";
+    if (have && nets) {
+        for (uint8_t i = 0; i < list.count; i++) {
+            cJSON *it = cJSON_CreateObject();
+            cJSON_AddStringToObject(it, "ssid", list.items[i].ssid);
+            cJSON_AddStringToObject(it, "pwd", list.items[i].pwd);
+            cJSON_AddItemToArray(nets, it);
+            if (list.selected == (int8_t)i) selected = list.items[i].ssid;
+        }
+    }
+    cJSON_AddStringToObject(root, "selected", have ? selected : "");
+
+    const char *txt = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!txt) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=glm-meter-config.json");
+    esp_err_t ret = httpd_resp_send(req, txt, HTTPD_RESP_USE_STRLEN);
+    cJSON_free((void *)txt);
+    return ret;
+}
+
+// 导入导出接口返回的配置 JSON:逐项校验后写回 NVS,恢复点选,重载网络任务并
+// 立即触发一次查询。v 字段当前只认 1(向前不兼容时由网页端提示)。
+static esp_err_t handler_import(httpd_req_t *req)
+{
+    cJSON *root = read_json_body(req);
+    if (!root) return ESP_FAIL;
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
+    if (!cJSON_IsNumber(v) || v->valueint != 1) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported version");
+        return ESP_FAIL;
+    }
+
+    bool ok = true;
+    cJSON *key = cJSON_GetObjectItemCaseSensitive(root, "api_key");
+    ok = ok && app_storage_save_api_key(cJSON_IsString(key) && key->valuestring ? key->valuestring : "");
+    cJSON *org = cJSON_GetObjectItemCaseSensitive(root, "org");
+    cJSON *proj = cJSON_GetObjectItemCaseSensitive(root, "project");
+    ok = ok && app_storage_save_org_project(
+                    cJSON_IsString(org) && org->valuestring ? org->valuestring : "",
+                    cJSON_IsString(proj) && proj->valuestring ? proj->valuestring : "");
+    cJSON *period = cJSON_GetObjectItemCaseSensitive(root, "period_s");
+    if (cJSON_IsNumber(period)) ok = ok && app_storage_save_period((uint16_t)period->valueint);
+    cJSON *soff = cJSON_GetObjectItemCaseSensitive(root, "screen_off_s");
+    if (cJSON_IsNumber(soff)) ok = ok && app_storage_save_screen_off((uint16_t)soff->valueint);
+
+    // 热点表逐条经 app_netlist_add 校验(超长/超量自动拒绝),再按 selected 恢复点选。
+    app_netlist_t list;
+    app_netlist_reset(&list);
+    cJSON *nets = cJSON_GetObjectItemCaseSensitive(root, "networks");
+    if (cJSON_IsArray(nets)) {
+        cJSON *it;
+        cJSON_ArrayForEach(it, nets) {
+            cJSON *s = cJSON_GetObjectItemCaseSensitive(it, "ssid");
+            cJSON *w = cJSON_GetObjectItemCaseSensitive(it, "pwd");
+            if (!cJSON_IsString(s) || !s->valuestring) continue;
+            if (!app_netlist_add(&list, s->valuestring,
+                                 cJSON_IsString(w) && w->valuestring ? w->valuestring : "")) break;
+        }
+    }
+    cJSON *sel = cJSON_GetObjectItemCaseSensitive(root, "selected");
+    if (cJSON_IsString(sel) && sel->valuestring && sel->valuestring[0]) {
+        (void)app_netlist_select(&list, sel->valuestring);
+    }
+    ok = ok && app_storage_save_netlist(&list);
+    cJSON_Delete(root);
+
+    if (ok) {
+        // 导入即生效:网络任务重载列表,查询任务立即用新配置。
+        app_net_reload_config();
+        app_glm_client_refresh_now();
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, ok ? "{\"ok\":true}" : "{\"ok\":false}",
+                           HTTPD_RESP_USE_STRLEN);
 }
 
 // 新增热点(免扫描):网页只提交 SSID/密码,设备端读旧表合并保存 —— 已存密码
@@ -486,13 +611,20 @@ static const char PAGE_HTML[] =
     "<button onclick=\"saveKey()\">保存</button>\n"
     "<small>保存后设备数秒内开始查询并显示在屏幕上;个人套餐填到这里即可</small></div>\n"
     "\n"
-    "<div class=\"card\"><h2>2 · 刷新周期</h2>\n"
+    "<div class=\"card\"><h2>2 · 刷新与熄屏</h2>\n"
+    "<div style=\"margin:2px 0;color:#9fb0bf;font-size:13px\">刷新周期</div>\n"
     "<select id=\"period\" onchange=\"savePeriod()\">\n"
     "<option value=60>1 分钟</option><option value=300>5 分钟</option>\n"
     "<option value=600>10 分钟</option><option value=900>15 分钟</option>\n"
     "<option value=1800>30 分钟</option><option value=3600>1 小时</option>\n"
     "</select>\n"
-    "<small>设备每隔这么久查询一次用量并刷新屏幕</small></div>\n"
+    "<div style=\"margin:8px 0 2px;color:#9fb0bf;font-size:13px\">无操作熄屏(按任意键唤醒)</div>\n"
+    "<select id=\"soff\" onchange=\"savePeriod()\">\n"
+    "<option value=60>1 分钟</option><option value=300>5 分钟</option>\n"
+    "<option value=600>10 分钟</option><option value=900>15 分钟</option>\n"
+    "<option value=1800>30 分钟</option><option value=0>永不</option>\n"
+    "</select>\n"
+    "<small>熄屏后屏幕全黑(背光+面板休眠),查询照常在后台运行;任意按键唤醒</small></div>\n"
     "\n"
     "<details class=\"card\"><summary style=\"font-size:15px;color:#7fd4a0\">3 · 团队上下文(选填) <span id=\"tbadge\" class=\"badge\">…</span></summary>\n"
     "<input type=\"text\" id=\"org\" placeholder=\"组织 ID org-…\">\n"
@@ -518,8 +650,11 @@ static const char PAGE_HTML[] =
     "<div id=\"saved2\"></div></details>\n"
     "\n"
     "<div class=\"card\"><h2>5 · 其他</h2>\n"
+    "<button onclick=\"exportCfg()\">导出配置</button>\n"
+    "<input type=\"file\" id=\"impfile\" accept=\"application/json,.json\" style=\"display:none\" onchange=\"importFile(this)\">\n"
+    "<button class=\"ghost\" onclick=\"document.getElementById('impfile').click()\">导入配置</button>\n"
     "<button class=\"danger\" onclick=\"clearAll()\">清除全部配置</button>\n"
-    "<small>将删除 API Key、团队上下文与所有已保存热点</small></div>\n"
+    "<small>导出/导入含 WiFi 密码与 API Key 的 JSON 文件,请妥善保管;导入后立即生效</small></div>\n"
     "</div>\n"
     "\n"
     "<script>\n"
@@ -555,6 +690,7 @@ static const char PAGE_HTML[] =
     "    badge('kbadge',!!s.key);\n"
     "    badge('tbadge',!!(s.org&&s.project));\n"
     "    if(s.period_s&&!$('period').dataset.done){$('period').value=String(s.period_s);$('period').dataset.done=1}\n"
+    "    if(s.screen_off_s!=null&&!$('soff').dataset.done){$('soff').value=String(s.screen_off_s);$('soff').dataset.done=1}\n"
     "    $('status').innerHTML=t;\n"
     "    if(online)loadSaved();\n"
     "  }catch(e){\n"
@@ -682,8 +818,29 @@ static const char PAGE_HTML[] =
     "  if(r.ok)alert('已保存。设备数秒内开始查询用量,请看屏幕');else alert('保存失败(长度超限?)');\n"
     "}\n"
     "async function savePeriod(){\n"
-    "  const r=await jpost('/api/key',{key:'',org:$('org').value.trim(),project:$('project').value.trim(),period:+$('period').value});\n"
-    "  if(r.ok)$('status').innerHTML='<span class=ok>刷新周期已保存并立即生效</span>';else alert('保存失败');\n"
+    "  const r=await jpost('/api/key',{key:'',org:$('org').value.trim(),project:$('project').value.trim(),period:+$('period').value,screen_off:+$('soff').value});\n"
+    "  if(r.ok)$('status').innerHTML='<span class=ok>已保存并立即生效</span>';else alert('保存失败');\n"
+    "}\n"
+    "async function exportCfg(){\n"
+    "  try{\n"
+    "    const r=await fetch('/api/config/export');\n"
+    "    const txt=await r.text();\n"
+    "    const b=new Blob([txt],{type:'application/json'});\n"
+    "    const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='glm-meter-config.json';a.click();URL.revokeObjectURL(a.href);\n"
+    "    $('status').innerHTML='<span class=ok>配置已导出为 JSON 文件</span>';\n"
+    "  }catch(e){alert('导出失败')}\n"
+    "}\n"
+    "async function importFile(input){\n"
+    "  const f=input.files&&input.files[0];if(!f)return;\n"
+    "  if(!confirm('导入将覆盖设备上的全部配置,继续?')){input.value='';return}\n"
+    "  try{\n"
+    "    const txt=await f.text();\n"
+    "    JSON.parse(txt);\n"
+    "    const r=await jpost('/api/config/import',JSON.parse(txt));\n"
+    "    if(r.ok){alert('导入成功,配置已生效;若更换了 WiFi,设备会按新列表自动连接');setTimeout(()=>location.reload(),800);}\n"
+    "    else alert('导入失败(内容无效或写入失败)');\n"
+    "  }catch(e){alert('文件不是有效的 JSON')}\n"
+    "  input.value='';\n"
     "}\n"
     "async function clearAll(){\n"
     "  if(!confirm('确定清除 API Key 与所有热点?'))return;\n"
@@ -754,7 +911,7 @@ bool app_portal_start(void)
 
     if (!s_http) {
         httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-        cfg.max_uri_handlers = 16;
+        cfg.max_uri_handlers = 18;
         cfg.stack_size = 6144; // 默认 4096 对 JSON 拼装略紧,加到 6KB
         if (httpd_start(&s_http, &cfg) != ESP_OK) {
             ESP_LOGE(TAG, "HTTP 服务启动失败");
@@ -770,6 +927,8 @@ bool app_portal_start(void)
             { .uri = "/api/key",       .method = HTTP_POST, .handler = handler_key },
             { .uri = "/api/networks",  .method = HTTP_POST, .handler = handler_networks },
             { .uri = "/api/networks/add", .method = HTTP_POST, .handler = handler_networks_add },
+            { .uri = "/api/config/export", .method = HTTP_GET,  .handler = handler_export },
+            { .uri = "/api/config/import", .method = HTTP_POST, .handler = handler_import },
             { .uri = "/api/delete",    .method = HTTP_POST, .handler = handler_delete },
             { .uri = "/api/discover",  .method = HTTP_POST, .handler = handler_discover },
             { .uri = "/api/connect",   .method = HTTP_POST, .handler = handler_connect },

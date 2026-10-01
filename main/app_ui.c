@@ -10,6 +10,7 @@
 //     任务持有控件指针,重建不产生悬空引用。
 #include "app_ui.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -21,6 +22,11 @@
 #include "bsp_battery.h"
 #include "bsp_button.h" // 复用其枚举值做键语义(见 app_ui_on_key 入参约定)
 #include "bsp_display.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_timer.h"
+#include "esp_lvgl_port.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lvgl.h"
 
 // ---- 应用字体(生成于 assets/fonts/,见该目录 README;中文+ASCII 子集) ----
@@ -40,10 +46,6 @@ static lv_font_t s_font24;
 #define COL_BAD 0xE5484D
 #define COL_BAR 0x24303C
 
-// 静息 5 分钟后背光降到 20%(小电池设备,编码规范要求避免屏幕长亮)。
-#define DIM_AFTER_MS (5 * 60 * 1000)
-#define DIM_PCT 20
-
 typedef struct {
     lv_obj_t *page;         // 当前页容器
     lv_obj_t *battery;      // 右上角电量
@@ -60,11 +62,13 @@ static ui_t s_ui;
 static int s_page;                 // 0=用量 1=网络(LVGL 上下文读写)
 static volatile int s_pending_page = -1; // 按键任务→LVGL 的切页请求;-1=无
 static lv_obj_t *s_scr;
-static uint32_t s_last_input_ms;   // 最近按键时刻(背光调暗用)
-static bool s_dimmed;
+static uint32_t s_last_input_ms;   // 最近按键时刻(保留:亮屏时显示层用)
+static atomic_bool s_screen_off;   // 面板睡眠中(portal_tick 熄屏 / input_task 唤醒,双任务访问)
+static int64_t s_last_input_us;    // 最近交互时刻(esp_timer 微秒;LVGL 停止后仍可靠)
+static int s_prefs_age;            // portal_tick 循环计数:周期性重读用户偏好
 static char s_saved_list_text[288]; // 已存热点段文本(网络页构建时读一次 NVS 生成,轮询复用;
                                     // 不能"只拼一次"——下一轮 set_text 会用不含它的文本覆盖)
-static char s_team_line[96];        // "团队:…"+"刷新:… 分钟" 两行状态(同上缓存策略)
+static char s_team_line[112];        // "团队:…"+"刷新:… 分钟" 两行状态(同上缓存策略)
 static char s_key_mask[24];        // "abcd…wxyz" 掩码,init 时生成一次
 
 // ---------------------------------------------------------------- 工具
@@ -246,10 +250,18 @@ static void rebuild_page(void)
         bool has_proj = app_storage_load_project(proj_chk, sizeof(proj_chk));
         uint16_t period_s = GLM_API_PERIOD_S;
         app_storage_load_period(&period_s);
+        uint16_t soff = 300;
+        app_storage_load_screen_off(&soff);
         snprintf(s_team_line, sizeof(s_team_line),
-                 "组织:%s\n项目:%s\n刷新:%u 分钟\n",
+                 "组织:%s\n项目:%s\n刷新:%u 分钟\n熄屏:%s\n",
                  has_org ? "已配置" : "未配置",
-                 has_proj ? "已配置" : "未配置", (unsigned)(period_s / 60));
+                 has_proj ? "已配置" : "未配置", (unsigned)(period_s / 60),
+                 soff == 0 ? "从不" : "");
+        if (soff != 0) {
+            char tail[24];
+            snprintf(tail, sizeof(tail), "%u 分钟\n", (unsigned)(soff / 60));
+            strncat(s_team_line, tail, sizeof(s_team_line) - strlen(s_team_line) - 1);
+        }
     }
     s_ui.page = lv_obj_create(s_scr);
     lv_obj_remove_style_all(s_ui.page);
@@ -421,20 +433,14 @@ static void poll_timer_cb(lv_timer_t *timer)
     }
     s_pending_page = -1;
 
-    // 2) 背光静息调暗。
-    if (!s_dimmed && lv_tick_elaps(s_last_input_ms) > DIM_AFTER_MS) {
-        bsp_display_backlight(DIM_PCT);
-        s_dimmed = true;
-    }
-
-    // 3) 电量:CW2017 寄存器读,代价低,每轮刷新。
+    // 2) 电量:CW2017 寄存器读,代价低,每轮刷新。
     if (s_ui.battery) {
         int soc = bsp_battery_soc();
         if (soc >= 0) lv_label_set_text_fmt(s_ui.battery, "%d%%", soc);
         else lv_label_set_text(s_ui.battery, "--");
     }
 
-    // 4) 页面内容。
+    // 3) 页面内容。
     if (s_page == 0 && s_ui.week_bar) {
         glm_usage_t u;
         glm_err_t err;
@@ -447,7 +453,7 @@ static void poll_timer_cb(lv_timer_t *timer)
         update_net_page();
     }
 
-    // 5) 配网横幅:仅在"AP 开着且未联网"时显示(联网后用户已不需要引导)。
+    // 4) 配网横幅:仅在"AP 开着且未联网"时显示(联网后用户已不需要引导)。
     if (s_ui.portal) {
         app_net_status_t st;
         app_net_get_status(&st);
@@ -462,12 +468,45 @@ static void poll_timer_cb(lv_timer_t *timer)
     }
 }
 
+// 唤醒序列:面板 Sleep Out(0x11,IDF 驱动内置 100ms 时序等待,再补 30ms 凑满
+// 规格要求的 120ms)→ 显示开(0x29)→ 恢复 LVGL 任务 → 背光 100。
+// 运行于 input 任务上下文:此时 LVGL 已停,esp_lcd 命令无并发;调用安全。
+static void screen_wake(void)
+{
+    esp_lcd_panel_handle_t panel = bsp_display_panel();
+    if (panel) {
+        (void)esp_lcd_panel_disp_sleep(panel, false);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        (void)esp_lcd_panel_disp_on_off(panel, true);
+    }
+    lvgl_port_resume();
+    bsp_display_backlight(100);
+    atomic_store(&s_screen_off, false);
+}
+
+// 熄屏序列:背光 0(最大头)→ 停 LVGL 任务(刷屏 SPI 流量与渲染归零)→
+// 面板显示关(0x28)+ Sleep In(0x10,µA 级)。运行于 portal tick(esp_timer)上下文,
+// LVGL 任务自身不调用 lvgl_port_stop(等自己退出会死锁),此处从其他任务停它是安全的。
+static void screen_sleep(void)
+{
+    bsp_display_backlight(0);
+    (void)lvgl_port_stop();
+    esp_lcd_panel_handle_t panel = bsp_display_panel();
+    if (panel) {
+        (void)esp_lcd_panel_disp_on_off(panel, false);
+        (void)esp_lcd_panel_disp_sleep(panel, true);
+    }
+    atomic_store(&s_screen_off, true);
+}
+
 void app_ui_on_key(int btn, int ev)
 {
     s_last_input_ms = lv_tick_get();
-    if (s_dimmed) {
-        bsp_display_backlight(100); // 任意按键恢复亮度(LEDC 写寄存器级,轻操作)
-        s_dimmed = false;
+    s_last_input_us = esp_timer_get_time();
+    // 熄屏中:任意按键只唤醒,不执行该键的动作(防口袋/误触),事件丢弃。
+    if (atomic_load(&s_screen_off)) {
+        screen_wake();
+        return;
     }
     // ev:0=单击 3=长按;btn:0=上 1=下 2=OK(见 app_ui.h 注释)。
     // 本函数运行在 input 任务上下文:只允许发请求/置标志,不做任何 lv_* 调用。
@@ -496,6 +535,19 @@ void app_ui_portal_tick(void)
     if (!st.portal_active) {
         app_portal_stop_dns();
     }
+
+    // 熄屏判定:每 30 秒重读一次用户偏好(门户可改),静息超时则熄屏。
+    // 用 esp_timer 计时 —— lvgl_port_stop 之后 lv_tick 会停,不能用。
+    if (++s_prefs_age >= 30) {
+        s_prefs_age = 0;
+        uint16_t off_s = 300;
+        app_storage_load_screen_off(&off_s);
+        if (off_s == 0) return; // 永不熄屏
+        int64_t idle_us = esp_timer_get_time() - s_last_input_us;
+        if (!atomic_load(&s_screen_off) && idle_us > (int64_t)off_s * 1000000LL) {
+            screen_sleep();
+        }
+    }
 }
 
 void app_ui_init(void)
@@ -515,5 +567,7 @@ void app_ui_init(void)
     s_page = 0;
     rebuild_page();
     s_last_input_ms = lv_tick_get();
+    s_last_input_us = esp_timer_get_time();
+    atomic_init(&s_screen_off, false);
     lv_timer_create(poll_timer_cb, 500, NULL);
 }
