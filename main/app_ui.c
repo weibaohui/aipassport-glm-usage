@@ -3,11 +3,17 @@
 // 视觉:深色底(#0E1116)+ 绿色强调(#35C26B),与基线 demo 的像素纸风完全不同;
 // 仅用 LVGL 基础控件(label/bar),不使用图片素材,便于小内存设备复用。
 //
+// 状态机:
+//   UI_MAIN  主页面(用量页/网络页,UP/DOWN 切换)
+//   UI_MENU  设置菜单(联网时长按 OK 进入;UP/DOWN 选择,OK 进子页,长按返回)
+//   UI_SUB_* 设置子页(刷新周期/熄屏时间/WiFi 管理/设备信息)
+//
 // 线程模型(关键):
-//   - 按键处理在 input 任务上下文,绝不能直接碰 lv_*;这里只置"待切页"标志。
-//   - 一切页面创建/销毁/改文本都发生在 LVGL 定时器回调(LVGL 任务上下文)。
-//   - 页内容在切页时整体重建:所有 UI 更新都来自定时器轮询共享快照,没有外部
-//     任务持有控件指针,重建不产生悬空引用。
+//   - 按键处理在 input 任务上下文:所有 UI 修改都在 bsp_lvgl_lock() 保护下进行
+//     (BSP 明确允许非 LVGL 任务持锁操作 lv_*);副作用(熄屏/刷新/连接请求)在
+//     解锁后执行,避免持锁做慢操作。
+//   - LVGL 轮询定时器运行于 LVGL 任务上下文,负责动态数据(用量/电量/告警)。
+//   - 页内容在进入一个状态时整体重建;重建只发生在持锁路径。
 #include "app_ui.h"
 
 #include <stdatomic.h>
@@ -22,9 +28,10 @@
 #include "bsp_battery.h"
 #include "bsp_button.h" // 复用其枚举值做键语义(见 app_ui_on_key 入参约定)
 #include "bsp_display.h"
+#include "esp_app_desc.h"
 #include "esp_lcd_panel_ops.h"
-#include "esp_timer.h"
 #include "esp_lvgl_port.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
@@ -45,49 +52,72 @@ static lv_font_t s_font24;
 #define COL_WARN 0xE5A13D
 #define COL_BAD 0xE5484D
 #define COL_BAR 0x24303C
+#define COL_CARD 0x171C24
+#define COL_SEL_BG 0x1D4030   // 选中行底色(绿色暗调)
+#define COL_TITLE 0xF2F5F7
+
+typedef enum {
+    UI_MAIN = 0,   // 主页面(用量/网络)
+    UI_MENU,       // 设置菜单
+    UI_SUB_REFRESH,// 刷新周期
+    UI_SUB_SOFF,   // 熄屏时间
+    UI_SUB_WIFI,   // WiFi 管理
+    UI_SUB_INFO,   // 设备信息
+} ui_state_t;
 
 typedef struct {
-    lv_obj_t *page;         // 当前页容器
-    lv_obj_t *warn;         // 右上角网络告警图标(红色 ⚠,断网/重连中显示)
+    lv_obj_t *page;         // 当前页容器(状态切换时整体重建)
     lv_obj_t *battery;      // 右上角电量
-    lv_obj_t *portal;       // 配网横幅(每页都有)
-    // 用量页控件
+    lv_obj_t *warn;         // 右上角网络告警 ⚠
+    // 用量页控件(仅 UI_MAIN+用量页有效)
     lv_obj_t *week_bar, *week_pct, *week_reset;
     lv_obj_t *h5_bar, *h5_pct, *h5_reset;
     lv_obj_t *mcp_val, *mcp_label, *foot;
     // 网络页控件
     lv_obj_t *net_lines;
+    // 配网横幅(仅主页面构建)
+    lv_obj_t *portal;
+    // 菜单/子页行控件(高亮刷新用)
+    lv_obj_t *rows[8];
+    int row_count;
 } ui_t;
 
 static ui_t s_ui;
-static int s_page;                 // 0=用量 1=网络(LVGL 上下文读写)
-static volatile int s_pending_page = -1; // 按键任务→LVGL 的切页请求;-1=无
+static ui_state_t s_state = UI_MAIN; // UI 状态(input 持锁写,轮询读;enum 对齐访问)
+static int s_page;                   // 主页面:0=用量 1=网络
+static int s_menu_sel;               // 菜单光标
+static int s_opt_sel;                // 子页选项光标
+static int s_wifi_sel;               // WiFi 页光标
 static lv_obj_t *s_scr;
-static uint32_t s_last_input_ms;   // 最近按键时刻(保留:亮屏时显示层用)
-static atomic_bool s_screen_off;   // 面板睡眠中(portal_tick 熄屏 / input_task 唤醒,双任务访问)
-static int64_t s_last_input_us;    // 最近交互时刻(esp_timer 微秒;LVGL 停止后仍可靠)
-static int s_prefs_age;            // portal_tick 循环计数:周期性重读用户偏好
-static char s_saved_list_text[288]; // 已存热点段文本(网络页构建时读一次 NVS 生成,轮询复用;
-                                    // 不能"只拼一次"——下一轮 set_text 会用不含它的文本覆盖)
-static char s_team_line[112];        // "团队:…"+"刷新:… 分钟" 两行状态(同上缓存策略)
-static char s_key_mask[24];        // "abcd…wxyz" 掩码,init 时生成一次
+static uint32_t s_last_input_ms;     // 最近按键时刻(保留:显示层用)
+static int64_t s_last_input_us;      // 最近交互时刻(esp_timer 微秒;熄屏判定用)
+static atomic_bool s_screen_off;     // 面板睡眠中(portal_tick 熄屏 / input_task 唤醒)
+static int s_prefs_age;              // portal_tick 循环计数:周期性重读用户偏好
+static char s_key_mask[24];          // "abcd…wxyz" 掩码(网络页/信息页重建时刷新)
+static char s_saved_list_text[112];  // 网络页配置摘要(组织/项目/刷新/熄屏,构建时生成)
+static char s_wifi_cache[APP_NETLIST_MAX][APP_NETLIST_SSID_MAX]; // WiFi 页条目快照
+static int s_wifi_cache_n;           // 快照条数
+
+static lv_obj_t *s_toast;         // 底部吐司(挂在 screen 上,跨页面)
+static lv_timer_t *s_toast_timer; // 吐司自动隐藏定时器
+
+// ---- 选项表(子页) ----
+static const uint16_t REFRESH_OPTS[] = { 60, 300, 600, 900, 1800, 3600 };
+static const char *REFRESH_LBL[] = { "1 分钟", "5 分钟", "10 分钟", "15 分钟", "30 分钟", "1 小时" };
+#define REFRESH_N 6
+static const uint16_t SOFF_OPTS[] = { 60, 300, 600, 900, 1800, 0 };
+static const char *SOFF_LBL[] = { "1 分钟", "5 分钟", "10 分钟", "15 分钟", "30 分钟", "永不" };
+#define SOFF_N 6
+
+static const char *MENU_LBL[] = {
+    LV_SYMBOL_REFRESH "  刷新周期",
+    LV_SYMBOL_BELL "  熄屏时间",
+    LV_SYMBOL_WIFI "  WiFi 管理",
+    LV_SYMBOL_LIST "  设备信息",
+};
+#define MENU_N 4
 
 // ---------------------------------------------------------------- 工具
-
-// 从 NVS 重读 API Key 生成掩码(abcd…wxyz;不足 8 位只显示前 2 位;无 Key="未设置")。
-// 不能只在开机时生成一次:门户保存 Key 后屏幕不会重启,网络页每次重建时调用本函数,
-// 显示才能与实际配置保持一致(团队/周期状态同理)。
-static void refresh_key_mask(void)
-{
-    char key[APP_STORAGE_API_KEY_MAX];
-    if (app_storage_load_api_key(key, sizeof(key))) {
-        size_t n = strlen(key);
-        if (n >= 8) snprintf(s_key_mask, sizeof(s_key_mask), "%.4s…%.4s", key, key + n - 4);
-        else snprintf(s_key_mask, sizeof(s_key_mask), "%.2s…", key);
-    } else {
-        snprintf(s_key_mask, sizeof(s_key_mask), "未设置");
-    }
-}
 
 static void style_label(lv_obj_t *l, const lv_font_t *f, uint32_t color)
 {
@@ -129,19 +159,71 @@ static void set_pct_text(lv_obj_t *l, int pct)
     else lv_label_set_text_fmt(l, "%d%%", pct);
 }
 
+// API Key 掩码(abcd…wxyz;不足 8 位只显示前 2 位;无 Key="未设置")。
+// 不能只在开机时生成一次:门户保存 Key 后屏幕不会重启,页面每次重建时调用。
+static void refresh_key_mask(void)
+{
+    char key[APP_STORAGE_API_KEY_MAX];
+    if (app_storage_load_api_key(key, sizeof(key))) {
+        size_t n = strlen(key);
+        if (n >= 8) snprintf(s_key_mask, sizeof(s_key_mask), "%.4s…%.4s", key, key + n - 4);
+        else snprintf(s_key_mask, sizeof(s_key_mask), "%.2s…", key);
+    } else {
+        snprintf(s_key_mask, sizeof(s_key_mask), "未设置");
+    }
+}
+
+// ---------------------------------------------------------------- 吐司
+
+// 底部吐司:圆角药丸,1.2s 自动消失。toast_timer_cb 由 LVGL 任务触发。
+static void toast_timer_cb(lv_timer_t *t)
+{
+    if (s_toast) lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_del(t);
+    s_toast_timer = NULL;
+}
+
+// 必须持 bsp_lvgl_lock() 调用。
+static void show_toast(const char *text)
+{
+    if (!s_toast) {
+        s_toast = lv_label_create(s_scr);
+        lv_obj_set_style_bg_color(s_toast, lv_color_hex(COL_CARD), 0);
+        lv_obj_set_style_bg_opa(s_toast, LV_OPA_80, 0);
+        lv_obj_set_style_radius(s_toast, 12, 0);
+        lv_obj_set_style_pad_hor(s_toast, 12, 0);
+        lv_obj_set_style_pad_ver(s_toast, 5, 0);
+        style_label(s_toast, &s_font16, 0xFFFFFF);
+        lv_obj_align(s_toast, LV_ALIGN_BOTTOM_MID, 0, -34);
+    }
+    lv_label_set_text(s_toast, text);
+    lv_obj_clear_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_toast);
+    if (s_toast_timer) lv_timer_del(s_toast_timer);
+    s_toast_timer = lv_timer_create(toast_timer_cb, 1200, NULL);
+}
+
 // ---------------------------------------------------------------- 页面构建
 
-// 顶部栏:标题 + 右上角电量(规范默认位;读 bsp_battery_soc,失败优雅降级)。
+// 顶部栏:标题 + 强调下划线 + 右上角电量/告警(每个状态页都有,风格统一)。
 static void build_top_bar(lv_obj_t *page, const char *title)
 {
     lv_obj_t *t = lv_label_create(page);
-    style_label(t, &s_font24, COL_TEXT);
+    style_label(t, &s_font24, COL_TITLE);
     lv_label_set_text(t, title);
-    lv_obj_set_pos(t, 12, 10);
+    lv_obj_set_pos(t, 12, 8);
+
+    // 强调色下划线:标题下方 40×3 圆角短条,统一视觉锚点。
+    lv_obj_t *ul = lv_obj_create(page);
+    lv_obj_remove_style_all(ul);
+    lv_obj_set_size(ul, 40, 3);
+    lv_obj_set_pos(ul, 14, 40);
+    lv_obj_set_style_bg_color(ul, lv_color_hex(COL_OK), 0);
+    lv_obj_set_style_radius(ul, 2, 0);
 
     s_ui.battery = lv_label_create(page);
     style_label(s_ui.battery, &s_font16, COL_DIM);
-    lv_obj_set_pos(s_ui.battery, 178, 16);
+    lv_obj_set_pos(s_ui.battery, 178, 14);
     lv_label_set_text(s_ui.battery, "--");
 
     // 网络告警图标:LVGL 内置符号(Montserrat 自带字形,不依赖中文字库)。
@@ -149,23 +231,42 @@ static void build_top_bar(lv_obj_t *page, const char *title)
     s_ui.warn = lv_label_create(page);
     lv_obj_set_style_text_font(s_ui.warn, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_ui.warn, lv_color_hex(COL_BAD), 0);
-    lv_obj_set_pos(s_ui.warn, 158, 16);
+    lv_obj_set_pos(s_ui.warn, 158, 15);
     lv_label_set_text(s_ui.warn, LV_SYMBOL_WARNING);
     lv_obj_add_flag(s_ui.warn, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void build_portal_banner(lv_obj_t *page)
+// 菜单/子页通用行:圆角卡片;cursor=光标高亮(绿底描边)。symbol/文本由调用方定。
+static lv_obj_t *make_row(lv_obj_t *page, int y, bool cursor,
+                          const char *symbol, const char *text)
 {
-    s_ui.portal = lv_label_create(page);
-    style_label(s_ui.portal, &s_font16, COL_WARN);
-    lv_obj_set_width(s_ui.portal, 216);
-    lv_label_set_long_mode(s_ui.portal, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(s_ui.portal, 12, 292);
-    lv_label_set_text(s_ui.portal, "");
+    lv_obj_t *row = lv_obj_create(page);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 216, 40);
+    lv_obj_set_pos(row, 12, y);
+    lv_obj_set_style_radius(row, 10, 0);
+    lv_obj_set_style_bg_color(row, lv_color_hex(cursor ? COL_SEL_BG : COL_CARD), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    if (cursor) {
+        lv_obj_set_style_border_color(row, lv_color_hex(COL_OK), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+    } else {
+        lv_obj_set_style_border_width(row, 0, 0);
+    }
+
+    lv_obj_t *sym = lv_label_create(row);
+    lv_obj_set_style_text_font(sym, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sym, lv_color_hex(cursor ? COL_OK : COL_DIM), 0);
+    lv_label_set_text(sym, symbol);
+    lv_obj_align(sym, LV_ALIGN_LEFT_MID, 10, 0);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    style_label(lbl, &s_font16, COL_TEXT);
+    lv_label_set_text(lbl, text);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 32, 0);
+    return row;
 }
 
-// 用量页:三组"标签+百分比+进度条",底部一行状态(套餐/倒计时/错误)。
-// 纵向节奏:行高 76px,三行 + 状态行 + 横幅,总计 320px 内。
 static void build_usage_page(lv_obj_t *page)
 {
     // 行 1:本周 token 额度
@@ -198,17 +299,18 @@ static void build_usage_page(lv_obj_t *page)
     lv_obj_set_pos(s_ui.h5_reset, 14, 176);
     lv_label_set_text(s_ui.h5_reset, "重置 --");
 
-    // 行 3:MCP 月度调用(个人套餐);团队套餐时由 update 改写为"剩余点数"。
-    s_ui.mcp_label = lv_label_create(page);
-    style_label(s_ui.mcp_label, &s_font16, COL_DIM);
-    lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
-    lv_obj_set_pos(s_ui.mcp_label, 14, 202);
+    // 行 3:MCP 月度调用(个人)/剩余重置次数(团队),无数值语义时不画条。
+    l = lv_label_create(page);
+    style_label(l, &s_font16, COL_DIM);
+    lv_label_set_text(l, "MCP 调用(每月)");
+    lv_obj_set_pos(l, 14, 202);
+    s_ui.mcp_label = l;
     s_ui.mcp_val = lv_label_create(page);
     style_label(s_ui.mcp_val, &s_font24, COL_TEXT);
     lv_obj_set_pos(s_ui.mcp_val, 140, 198);
     lv_label_set_text(s_ui.mcp_val, "--");
-    // 行 3 无进度条(剩余重置次数没有百分比语义)。
-    // 状态行:套餐 + 刷新倒计时/错误(超长截尾),占用原进度条位置。
+
+    // 状态行:套餐 + 刷新倒计时/错误(超长截尾)。
     s_ui.foot = lv_label_create(page);
     style_label(s_ui.foot, &s_font16, COL_DIM);
     lv_obj_set_width(s_ui.foot, 216);
@@ -227,87 +329,250 @@ static void build_net_page(lv_obj_t *page)
     lv_label_set_text(s_ui.net_lines, "加载中…");
 }
 
-// 重建当前页:删除旧容器(连带全部子对象)后按 s_page 重新构建。s_ui 内所有
-// 控件指针随本次构建重新赋值,不残留悬空指针。
+static void build_menu(lv_obj_t *page)
+{
+    for (int i = 0; i < MENU_N; i++) {
+        bool cursor = (i == s_menu_sel);
+        lv_obj_t *row = make_row(page, 52 + i * 48, cursor, " ", MENU_LBL[i]);
+        // 右侧箭头:提示"OK 进入"。
+        lv_obj_t *arrow = lv_label_create(row);
+        lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(arrow, lv_color_hex(COL_DIM), 0);
+        lv_label_set_text(arrow, LV_SYMBOL_RIGHT);
+        lv_obj_align(arrow, LV_ALIGN_RIGHT_MID, -10, 0);
+        s_ui.rows[i] = row;
+    }
+    s_ui.row_count = MENU_N;
+
+    lv_obj_t *hint = lv_label_create(page);
+    style_label(hint, &s_font16, COL_DIM);
+    lv_label_set_text(hint, "OK 进入 · 长按返回");
+    lv_obj_set_pos(hint, 14, 254);
+}
+
+// 子页选项列表:cursor 高亮光标;当前已存值行前带绿色 ✓。
+static void build_option_page(lv_obj_t *page, const uint16_t *opts,
+                              const char **lbls, int n, uint16_t current)
+{
+    for (int i = 0; i < n; i++) {
+        bool cursor = (i == s_opt_sel);
+        bool is_current = (opts[i] == current);
+        char text[40];
+        snprintf(text, sizeof(text), "%s %s", is_current ? LV_SYMBOL_OK : " ", lbls[i]);
+        s_ui.rows[i] = make_row(page, 52 + i * 44, cursor,
+                                cursor ? LV_SYMBOL_RIGHT : " ", text);
+    }
+    s_ui.row_count = n;
+
+    lv_obj_t *hint = lv_label_create(page);
+    style_label(hint, &s_font16, COL_DIM);
+    lv_label_set_text(hint, "OK 保存 · 长按返回");
+    lv_obj_set_pos(hint, 14, 254);
+}
+
+static void build_wifi_page(lv_obj_t *page)
+{
+    app_netlist_t list;
+    bool have = app_storage_load_netlist(&list);
+    s_wifi_cache_n = 0;
+    if (have) {
+        for (uint8_t i = 0; i < list.count; i++) {
+            strncpy(s_wifi_cache[i], list.items[i].ssid, APP_NETLIST_SSID_MAX - 1);
+            s_wifi_cache[i][APP_NETLIST_SSID_MAX - 1] = '\0';
+            s_wifi_cache_n++;
+        }
+    }
+    if (s_wifi_sel >= s_wifi_cache_n) s_wifi_sel = s_wifi_cache_n - 1;
+    if (s_wifi_sel < 0) s_wifi_sel = 0;
+
+    if (s_wifi_cache_n == 0) {
+        lv_obj_t *empty = lv_label_create(page);
+        style_label(empty, &s_font16, COL_DIM);
+        lv_label_set_text(empty, "暂无已存热点\n请通过网页配网添加");
+        lv_obj_set_pos(empty, 14, 70);
+    } else {
+        app_net_status_t st;
+        app_net_get_status(&st);
+        int shown = s_wifi_cache_n > 5 ? 5 : s_wifi_cache_n;
+        for (int i = 0; i < shown; i++) {
+            bool cursor = (i == s_wifi_sel);
+            bool current = (strcmp(st.cur_ssid, s_wifi_cache[i]) == 0);
+            char text[APP_NETLIST_SSID_MAX + 8];
+            snprintf(text, sizeof(text), "%s %s",
+                     current ? LV_SYMBOL_OK : " ", s_wifi_cache[i]);
+            make_row(page, 52 + i * 44, cursor,
+                     cursor ? LV_SYMBOL_RIGHT : " ", text);
+        }
+    }
+
+    lv_obj_t *hint = lv_label_create(page);
+    style_label(hint, &s_font16, COL_DIM);
+    lv_label_set_text(hint, s_wifi_cache_n ? "OK 连接 · 长按返回" : "长按返回");
+    lv_obj_set_pos(hint, 14, 282);
+}
+
+static void build_info_page(lv_obj_t *page)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    app_net_status_t st;
+    app_net_get_status(&st);
+    refresh_key_mask();
+    char org[64] = { 0 }, proj[64] = { 0 };
+    bool team = app_storage_load_org(org, sizeof(org)) &&
+                app_storage_load_project(proj, sizeof(proj));
+    uint16_t period_s = GLM_API_PERIOD_S, soff = 300;
+    app_storage_load_period(&period_s);
+    app_storage_load_screen_off(&soff);
+
+    const char *team_str = team ? "已配置" : "未配置";
+    char soff_str[16];
+    snprintf(soff_str, sizeof(soff_str), soff == 0 ? "永不" : "%u 分钟",
+             (unsigned)(soff / 60));
+
+    const struct { const char *k; char v[72]; } rows[] = {
+        { "固件", { 0 } },
+        { "IP", { 0 } },
+        { "信号", { 0 } },
+        { "API Key", { 0 } },
+        { "团队", { 0 } },
+        { "刷新 / 熄屏", { 0 } },
+    };
+    snprintf((char *)rows[0].v, sizeof(rows[0].v), "%s", app->version);
+    snprintf((char *)rows[1].v, sizeof(rows[1].v), "%s", st.ip[0] ? st.ip : "未连接");
+    snprintf((char *)rows[2].v, sizeof(rows[2].v), "%d dBm", st.rssi);
+    snprintf((char *)rows[3].v, sizeof(rows[3].v), "%s", s_key_mask);
+    snprintf((char *)rows[4].v, sizeof(rows[4].v), "%s", team_str);
+    snprintf((char *)rows[5].v, sizeof(rows[5].v), "%u 分钟 / %s",
+             (unsigned)(period_s / 60), soff_str);
+
+    int y = 56;
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        lv_obj_t *k = lv_label_create(page);
+        style_label(k, &s_font16, COL_DIM);
+        lv_label_set_text(k, rows[i].k);
+        lv_obj_set_pos(k, 14, y);
+
+        lv_obj_t *v = lv_label_create(page);
+        style_label(v, &s_font16, COL_TEXT);
+        lv_obj_set_width(v, 130);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+        lv_label_set_text(v, rows[i].v);
+        lv_obj_set_pos(v, 100, y);
+        y += 30;
+    }
+
+    lv_obj_t *hint = lv_label_create(page);
+    style_label(hint, &s_font16, COL_DIM);
+    lv_label_set_text(hint, "OK 返回");
+    lv_obj_set_pos(hint, 14, 254);
+}
+
+// 重建当前状态页:删除旧容器后按 s_state 重新构建。持锁调用。
 static void rebuild_page(void)
 {
     if (s_ui.page) {
         lv_obj_delete(s_ui.page);
         memset(&s_ui, 0, sizeof(s_ui));
     }
-    s_saved_list_text[0] = '\0';
-    s_team_line[0] = '\0';
-    if (s_page == 1) {
-        refresh_key_mask(); // Key 可能刚在门户被保存/清除,重建时重读
-        app_netlist_t list;
-        if (app_storage_load_netlist(&list) && list.count > 0) {
-            size_t used = (size_t)snprintf(s_saved_list_text, sizeof(s_saved_list_text), "已存热点:\n");
-            for (uint8_t i = 0; i < list.count && used < sizeof(s_saved_list_text) - 48; i++) {
-                used += (size_t)snprintf(s_saved_list_text + used,
-                                         sizeof(s_saved_list_text) - used, "%s %s\n",
-                                         list.selected == (int8_t)i ? ">" : "·",
-                                         list.items[i].ssid);
-            }
-        } else {
-            snprintf(s_saved_list_text, sizeof(s_saved_list_text), "已存热点:无\n");
-        }
-        // 团队上下文与刷新周期状态(真机可看的配置摘要,与门户一致)。
-        // 参数一行一个(组织、项目、刷新各自独立一行;周期都是 60 的倍数按分钟显示)。
-        // 组织与项目目前成对保存,状态一致,但分行显示便于核对每一项。
-        char org_chk[64] = { 0 }, proj_chk[64] = { 0 };
-        bool has_org = app_storage_load_org(org_chk, sizeof(org_chk));
-        bool has_proj = app_storage_load_project(proj_chk, sizeof(proj_chk));
-        uint16_t period_s = GLM_API_PERIOD_S;
-        app_storage_load_period(&period_s);
-        uint16_t soff = 300;
-        app_storage_load_screen_off(&soff);
-        snprintf(s_team_line, sizeof(s_team_line),
-                 "组织:%s\n项目:%s\n刷新:%u 分钟\n熄屏:%s\n",
-                 has_org ? "已配置" : "未配置",
-                 has_proj ? "已配置" : "未配置", (unsigned)(period_s / 60),
-                 soff == 0 ? "从不" : "");
-        if (soff != 0) {
-            char tail[24];
-            snprintf(tail, sizeof(tail), "%u 分钟\n", (unsigned)(soff / 60));
-            strncat(s_team_line, tail, sizeof(s_team_line) - strlen(s_team_line) - 1);
-        }
-    }
     s_ui.page = lv_obj_create(s_scr);
     lv_obj_remove_style_all(s_ui.page);
     lv_obj_set_size(s_ui.page, 240, 320);
 
-    if (s_page == 0) {
-        build_top_bar(s_ui.page, "GLM 用量");
-        build_usage_page(s_ui.page);
-    } else {
-        build_top_bar(s_ui.page, "网络");
-        build_net_page(s_ui.page);
+    switch (s_state) {
+    case UI_MAIN:
+        if (s_page == 0) {
+            build_top_bar(s_ui.page, "GLM 用量");
+            build_usage_page(s_ui.page);
+        } else {
+            refresh_key_mask();
+            // 配置摘要(组织/项目/刷新/熄屏),网络页构建时读一次 NVS。
+            char org[64] = { 0 }, proj[64] = { 0 };
+            bool has_org = app_storage_load_org(org, sizeof(org));
+            bool has_proj = app_storage_load_project(proj, sizeof(proj));
+            uint16_t period_s = GLM_API_PERIOD_S, soff = 300;
+            app_storage_load_period(&period_s);
+            app_storage_load_screen_off(&soff);
+            snprintf(s_saved_list_text, sizeof(s_saved_list_text),
+                     "组织:%s\n项目:%s\n刷新:%u 分钟\n熄屏:%s\n",
+                     has_org ? "已配置" : "未配置",
+                     has_proj ? "已配置" : "未配置",
+                     (unsigned)(period_s / 60),
+                     soff == 0 ? "永不" : "");
+            if (soff != 0) {
+                char tail[24];
+                snprintf(tail, sizeof(tail), "%u 分钟\n", (unsigned)(soff / 60));
+                strncat(s_saved_list_text, tail, sizeof(s_saved_list_text) - strlen(s_saved_list_text) - 1);
+            }
+            build_top_bar(s_ui.page, "网络");
+            build_net_page(s_ui.page);
+        }
+        // 配网横幅:仅主页面有(菜单里不需要)。
+        s_ui.portal = lv_label_create(s_ui.page);
+        style_label(s_ui.portal, &s_font16, COL_WARN);
+        lv_obj_set_width(s_ui.portal, 216);
+        lv_label_set_long_mode(s_ui.portal, LV_LABEL_LONG_WRAP);
+        lv_obj_set_pos(s_ui.portal, 12, 292);
+        lv_label_set_text(s_ui.portal, "");
+        break;
+    case UI_MENU:
+        build_top_bar(s_ui.page, "设置");
+        build_menu(s_ui.page);
+        break;
+    case UI_SUB_REFRESH: {
+        build_top_bar(s_ui.page, "刷新周期");
+        uint16_t cur = GLM_API_PERIOD_S;
+        app_storage_load_period(&cur);
+        build_option_page(s_ui.page, REFRESH_OPTS, REFRESH_LBL, REFRESH_N, cur);
+        break;
     }
-    build_portal_banner(s_ui.page);
+    case UI_SUB_SOFF: {
+        build_top_bar(s_ui.page, "熄屏时间");
+        uint16_t cur = 300;
+        app_storage_load_screen_off(&cur);
+        build_option_page(s_ui.page, SOFF_OPTS, SOFF_LBL, SOFF_N, cur);
+        break;
+    }
+    case UI_SUB_WIFI:
+        build_top_bar(s_ui.page, "WiFi 管理");
+        build_wifi_page(s_ui.page);
+        break;
+    case UI_SUB_INFO:
+        build_top_bar(s_ui.page, "设备信息");
+        build_info_page(s_ui.page);
+        break;
+    }
+}
+
+// 光标移动后仅刷新行样式(不重建页面),输入路径下反馈即时。持锁调用。
+static void refresh_rows_cursor(int sel)
+{
+    for (int i = 0; i < s_ui.row_count; i++) {
+        lv_obj_t *row = s_ui.rows[i];
+        if (!row) continue;
+        bool cursor = (i == sel);
+        lv_obj_set_style_bg_color(row, lv_color_hex(cursor ? COL_SEL_BG : COL_CARD), 0);
+        if (cursor) lv_obj_set_style_border_width(row, 1, 0);
+        else lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_t *sym = lv_obj_get_child(row, 0);
+        if (sym) lv_obj_set_style_text_color(sym, lv_color_hex(cursor ? COL_OK : COL_DIM), 0);
+    }
 }
 
 // ---------------------------------------------------------------- 数据刷新
-
-// 重置行:"重置 时间"。
-static void set_reset_line(lv_obj_t *label, int64_t reset_ms)
-{
-    char buf[16];
-    lv_label_set_text_fmt(label, "重置 %s",
-                          glm_usage_format_reset_ms(reset_ms, buf, sizeof(buf)));
-}
 
 static void update_usage_page(const glm_usage_t *u)
 {
     set_bar_pct(s_ui.week_bar, u->tokens_week_used_pct);
     set_pct_text(s_ui.week_pct, u->tokens_week_used_pct);
-    set_reset_line(s_ui.week_reset, u->tokens_week_reset_ms);
+    char buf[16];
+    lv_label_set_text_fmt(s_ui.week_reset, "重置 %s",
+                          glm_usage_format_reset_ms(u->tokens_week_reset_ms, buf, sizeof(buf)));
 
     set_bar_pct(s_ui.h5_bar, u->tokens_5h_used_pct);
     set_pct_text(s_ui.h5_pct, u->tokens_5h_used_pct);
-    set_reset_line(s_ui.h5_reset, u->tokens_5h_reset_ms);
+    lv_label_set_text_fmt(s_ui.h5_reset, "重置 %s",
+                          glm_usage_format_reset_ms(u->tokens_5h_reset_ms, buf, sizeof(buf)));
 
-    // 行 3:个人套餐显示 MCP 每月调用(已用/总量);团队套餐显示剩余重置次数
-    // (周 / 5 小时窗口各自还能重置几次,来自 customer-package-reset 接口)。
     if (u->mcp_total > 0) {
         lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
         lv_label_set_text_fmt(s_ui.mcp_val, "%d/%d", u->mcp_used, u->mcp_total);
@@ -339,7 +604,7 @@ static void update_foot(const glm_usage_t *u, glm_err_t err, bool last_ok,
         switch (err) {
         case GLM_ERR_WAIT_NET: msg = "等待网络连接…"; break;
         case GLM_ERR_WAIT_TIME: msg = "正在对时…"; break;
-        case GLM_ERR_AUTH: msg = "Key 无效,长按OK配网"; break;
+        case GLM_ERR_AUTH: msg = "Key 无效,网页可改"; break;
         case GLM_ERR_PARSE: msg = "响应异常,稍后重试"; break;
         default: {
             char buf[48];
@@ -417,33 +682,23 @@ static void update_net_page(void)
         break;
     }
     used += (size_t)snprintf(text + used, sizeof(text) - used, "API Key:%s\n", s_key_mask);
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "%s", s_team_line);
-
     used += (size_t)snprintf(text + used, sizeof(text) - used, "%s", s_saved_list_text);
     // 联网后管理页走局域网 IP(同一套配网页:改 Key/选项目/改热点都用它)。
     if (st.state == APP_NET_ONLINE && st.ip[0]) {
         used += (size_t)snprintf(text + used, sizeof(text) - used,
                                  "管理页 http://%s\n", st.ip);
     }
-    used += (size_t)snprintf(text + used, sizeof(text) - used,
-                             "OK:熄屏/亮屏\n长按OK:配网\n用量页按上:手动刷新");
+    used += (size_t)snprintf(text + used, sizeof(text) - used, "长按OK:设置菜单");
     lv_label_set_text(s_ui.net_lines, text);
 }
 
-// ---------------------------------------------------------------- 定时器与入口
+// ---------------------------------------------------------------- 定时器
 
 static void poll_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    // 1) 应用待切页请求(按键任务只置标志,重建在这里 = LVGL 上下文,安全)。
-    if (s_pending_page >= 0 && s_pending_page != s_page) {
-        s_page = s_pending_page;
-        rebuild_page();
-    }
-    s_pending_page = -1;
-
-    // 2) 电量 + 网络告警:每轮取一次网络快照,两处共用。
+    // 1) 电量 + 网络告警:每轮取一次网络快照,多处共用。
     app_net_status_t net;
     app_net_get_status(&net);
     if (s_ui.battery) {
@@ -457,8 +712,8 @@ static void poll_timer_cb(lv_timer_t *timer)
         else lv_obj_add_flag(s_ui.warn, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // 3) 页面内容。
-    if (s_page == 0 && s_ui.week_bar) {
+    // 2) 页面动态内容(仅主页面;菜单/子页为静态构建)。
+    if (s_state == UI_MAIN && s_page == 0 && s_ui.week_bar) {
         glm_usage_t u;
         glm_err_t err;
         int64_t fetch_epoch_s;
@@ -466,12 +721,12 @@ static void poll_timer_cb(lv_timer_t *timer)
         app_glm_client_get_snapshot(&u, &err, &fetch_epoch_s, &last_ok);
         update_usage_page(&u);
         update_foot(&u, err, last_ok, fetch_epoch_s);
-    } else if (s_page == 1 && s_ui.net_lines) {
+    } else if (s_state == UI_MAIN && s_page == 1 && s_ui.net_lines) {
         update_net_page();
     }
 
-    // 4) 配网横幅:仅在"AP 开着且未联网"时显示(联网后用户已不需要引导)。
-    if (s_ui.portal) {
+    // 3) 配网横幅:仅主页面,AP 开着未联网时显示。
+    if (s_state == UI_MAIN && s_ui.portal) {
         if (net.portal_active && net.state != APP_NET_ONLINE) {
             lv_label_set_text_fmt(s_ui.portal,
                                   "配网中:连接热点 %s,电脑打开 192.168.4.1",
@@ -482,6 +737,8 @@ static void poll_timer_cb(lv_timer_t *timer)
         }
     }
 }
+
+// ---------------------------------------------------------------- 熄屏/唤醒
 
 // 唤醒序列:面板 Sleep Out(0x11,IDF 驱动内置 100ms 时序等待,再补 30ms 凑满
 // 规格要求的 120ms)→ 显示开(0x29)→ 恢复 LVGL 任务 → 背光 100。
@@ -500,8 +757,9 @@ static void screen_wake(void)
 }
 
 // 熄屏序列:背光 0(最大头)→ 停 LVGL 任务(刷屏 SPI 流量与渲染归零)→
-// 面板显示关(0x28)+ Sleep In(0x10,µA 级)。运行于 portal tick(esp_timer)上下文,
-// LVGL 任务自身不调用 lvgl_port_stop(等自己退出会死锁),此处从其他任务停它是安全的。
+// 面板显示关(0x28)+ Sleep In(0x10,µA 级)。两个调用方:
+//   portal tick(esp_timer,自动熄屏)与 input 任务(OK 手动熄屏)。
+// 都不是 LVGL 任务 —— lvgl_port_stop 不能由 LVGL 任务自己调用(死锁)。
 static void screen_sleep(void)
 {
     bsp_display_backlight(0);
@@ -514,36 +772,125 @@ static void screen_sleep(void)
     atomic_store(&s_screen_off, true);
 }
 
+// ---------------------------------------------------------------- 按键处理
+
+// 键事件入口(input 任务):所有 UI 修改在 bsp_lvgl_lock 下;副作用在锁外。
 void app_ui_on_key(int btn, int ev)
 {
     s_last_input_ms = lv_tick_get();
     s_last_input_us = esp_timer_get_time();
+
     // 熄屏中:任意按键只唤醒,不执行该键的动作(防口袋/误触),事件丢弃。
     if (atomic_load(&s_screen_off)) {
         screen_wake();
         return;
     }
-    // ev:0=单击 3=长按;btn:0=上 1=下 2=OK(见 app_ui.h 注释)。
-    // 本函数运行在 input 任务上下文:只允许发请求/置标志,不做任何 lv_* 调用。
-    if (btn == (int)BSP_BTN_OK && ev == 3) {
-        app_net_start_portal(); // 长按 OK:进入配网(portal tick 随后拉起 HTTP/DNS)
-        return;
+
+    // 副作用收集:持锁阶段只改 UI/状态,解锁后执行。
+    bool do_sleep = false;
+    bool do_refresh = false;
+    bool do_portal = false;
+
+    if (!bsp_lvgl_lock(300)) {
+        return; // 锁超时(极少见):丢弃本次按键,下一键恢复
     }
-    if (btn == (int)BSP_BTN_OK && ev == 0) {
-        // 单击 OK:手动熄屏;熄屏态下任意键(含 OK)已在前面的分支唤醒。
-        // 手动刷新不再绑 OK(移到上键)—— 避免单击/双击语义冲突。
-        screen_sleep();
-        return;
+
+    switch (s_state) {
+    case UI_MAIN:
+        if (btn == (int)BSP_BTN_OK && ev == 3) {
+            // 长按 OK:联网进设置菜单;未联网进配网(保证首次/户外可用性)。
+            app_net_status_t st;
+            app_net_get_status(&st);
+            if (st.state == APP_NET_ONLINE) s_state = UI_MENU;
+            else do_portal = true;
+            rebuild_page();
+        } else if (btn == (int)BSP_BTN_OK && ev == 0) {
+            do_sleep = true; // 单击 OK:手动熄屏;唤醒走最前面的分支
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
+            if (s_page == 0) do_refresh = true;
+            else { s_page = 0; rebuild_page(); }
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
+            s_page = 1;
+            rebuild_page();
+        }
+        break;
+
+    case UI_MENU:
+        if (ev == 3) {
+            s_state = UI_MAIN;
+            rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
+            s_menu_sel = (s_menu_sel + MENU_N - 1) % MENU_N;
+            refresh_rows_cursor(s_menu_sel);
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
+            s_menu_sel = (s_menu_sel + 1) % MENU_N;
+            refresh_rows_cursor(s_menu_sel);
+        } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
+            s_opt_sel = 0;
+            s_state = (s_menu_sel == 0) ? UI_SUB_REFRESH
+                    : (s_menu_sel == 1) ? UI_SUB_SOFF
+                    : (s_menu_sel == 2) ? UI_SUB_WIFI : UI_SUB_INFO;
+            rebuild_page();
+        }
+        break;
+
+    case UI_SUB_REFRESH:
+    case UI_SUB_SOFF: {
+        const uint16_t *opts = (s_state == UI_SUB_REFRESH) ? REFRESH_OPTS : SOFF_OPTS;
+        int n = (s_state == UI_SUB_REFRESH) ? REFRESH_N : SOFF_N;
+        if (ev == 3) {
+            s_state = UI_MENU;
+            rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
+            s_opt_sel = (s_opt_sel + n - 1) % n;
+            refresh_rows_cursor(s_opt_sel);
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
+            s_opt_sel = (s_opt_sel + 1) % n;
+            refresh_rows_cursor(s_opt_sel);
+        } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
+            uint16_t v = opts[s_opt_sel];
+            bool ok = (s_state == UI_SUB_REFRESH) ? app_storage_save_period(v)
+                                                  : app_storage_save_screen_off(v);
+            app_glm_client_refresh_now(); // 刷新周期变化立即生效
+            s_state = UI_MENU;
+            rebuild_page();
+            show_toast(ok ? "已保存并生效" : "保存失败");
+        }
+        break;
     }
-    if (ev == 0 && btn == (int)BSP_BTN_UP) {
-        // 上键:用量页=手动立即刷新;网络页=切回用量页。
-        if (s_page == 0) app_glm_client_refresh_now();
-        else s_pending_page = 0;
-        return;
+
+    case UI_SUB_WIFI:
+        if (ev == 3) {
+            s_state = UI_MENU;
+            rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP && s_wifi_cache_n > 0) {
+            s_wifi_sel = (s_wifi_sel + s_wifi_cache_n - 1) % s_wifi_cache_n;
+            rebuild_page(); // 行内容含连接标记,重建最稳
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN && s_wifi_cache_n > 0) {
+            s_wifi_sel = (s_wifi_sel + 1) % s_wifi_cache_n;
+            rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_OK && s_wifi_cache_n > 0) {
+            app_net_connect_ssid(s_wifi_cache[s_wifi_sel]);
+            s_state = UI_MAIN;
+            s_page = 1; // 网络页能看到连接进度
+            rebuild_page();
+            show_toast("正在连接,请稍候…");
+        }
+        break;
+
+    case UI_SUB_INFO:
+        // 信息页无动作项:任意键返回菜单。
+        s_state = UI_MENU;
+        rebuild_page();
+        break;
     }
-    if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
-        s_pending_page = 1; // 下键:切到网络页
-    }
+
+    bsp_lvgl_unlock();
+
+    // ---- 副作用(锁外) ----
+    if (do_sleep) screen_sleep();
+    if (do_refresh) app_glm_client_refresh_now();
+    if (do_portal) app_net_start_portal();
 }
 
 void app_ui_portal_tick(void)
@@ -587,7 +934,9 @@ void app_ui_init(void)
     lv_obj_set_style_bg_color(s_scr, lv_color_hex(COL_BG), 0);
     lv_screen_load(s_scr);
 
+    s_state = UI_MAIN;
     s_page = 0;
+    s_menu_sel = 0;
     rebuild_page();
     s_last_input_ms = lv_tick_get();
     s_last_input_us = esp_timer_get_time();

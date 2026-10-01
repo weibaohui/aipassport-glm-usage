@@ -15,7 +15,7 @@ idf_component_register(
          "app_ui.c"
     INCLUDE_DIRS "."
     REQUIRES bsp esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
-             json esp_http_client esp-tls esp_http_server lwip
+             json esp_http_client esp-tls esp_http_server lwip app_update
 )
 
 # 应用中文字体子集(生成物,来源/命令/字符清单见 assets/fonts/README.zh_CN.md)。
