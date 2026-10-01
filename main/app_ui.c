@@ -416,7 +416,8 @@ static void update_net_page(void)
         used += (size_t)snprintf(text + used, sizeof(text) - used,
                                  "管理页 http://%s\n", st.ip);
     }
-    used += (size_t)snprintf(text + used, sizeof(text) - used, "长按OK:配网");
+    used += (size_t)snprintf(text + used, sizeof(text) - used,
+                             "OK:熄屏/亮屏\n长按OK:配网\n用量页按上:手动刷新");
     lv_label_set_text(s_ui.net_lines, text);
 }
 
@@ -515,11 +516,19 @@ void app_ui_on_key(int btn, int ev)
         return;
     }
     if (btn == (int)BSP_BTN_OK && ev == 0) {
-        app_glm_client_refresh_now(); // 单击 OK:手动立即刷新
+        // 单击 OK:手动熄屏;熄屏态下任意键(含 OK)已在前面的分支唤醒。
+        // 手动刷新不再绑 OK(移到上键)—— 避免单击/双击语义冲突。
+        screen_sleep();
         return;
     }
-    if (ev == 0 && (btn == (int)BSP_BTN_UP || btn == (int)BSP_BTN_DOWN)) {
-        s_pending_page = (btn == (int)BSP_BTN_UP) ? 0 : 1; // 上=用量页,下=网络页
+    if (ev == 0 && btn == (int)BSP_BTN_UP) {
+        // 上键:用量页=手动立即刷新;网络页=切回用量页。
+        if (s_page == 0) app_glm_client_refresh_now();
+        else s_pending_page = 0;
+        return;
+    }
+    if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
+        s_pending_page = 1; // 下键:切到网络页
     }
 }
 
