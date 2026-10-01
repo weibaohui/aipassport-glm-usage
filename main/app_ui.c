@@ -355,10 +355,6 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
     s_ui.row_count = n + 1;
 }
 
-// WiFi 页光标范围:0..count(最后一个索引是"返回"行)。超过 5 条时用
-// s_wifi_off 滚动窗口保证光标可见。
-static int s_wifi_off;
-
 static void build_wifi_page(lv_obj_t *page)
 {
     app_netlist_t list;
@@ -386,25 +382,20 @@ static void build_wifi_page(lv_obj_t *page)
 
     app_net_status_t st;
     app_net_get_status(&st);
-    int shown = s_wifi_cache_n > 5 ? 5 : s_wifi_cache_n;
-    // 滚动窗口:让光标落在可见范围。
-    if (s_wifi_off > s_wifi_cache_n - shown) s_wifi_off = s_wifi_cache_n - shown;
-    if (s_wifi_off < 0) s_wifi_off = 0;
-    if (s_wifi_sel < s_wifi_off) s_wifi_off = s_wifi_sel;
-    if (s_wifi_sel >= s_wifi_off + shown) s_wifi_off = s_wifi_sel - shown + 1;
-
-    for (int i = 0; i < shown; i++) {
-        int idx = s_wifi_off + i;
-        bool cursor = (idx == s_wifi_sel);
-        bool current = (strcmp(st.cur_ssid, s_wifi_cache[idx]) == 0);
+    // 全量绘制:已存热点最多 APP_NETLIST_MAX(8)条 + 返回行,行高 30
+    // (8×30+46+返回 30=316 ≤ 320,一屏放得下),不做滚动窗口 —— 窗口换页
+    // 会让行对象与高亮索引错位(实测:选返回时上方残留高亮空行)。
+    for (int i = 0; i < s_wifi_cache_n; i++) {
+        bool cursor = (i == s_wifi_sel);
+        bool current = (strcmp(st.cur_ssid, s_wifi_cache[i]) == 0);
         char text[APP_NETLIST_SSID_MAX + 8];
         snprintf(text, sizeof(text), "%s %s",
-                 current ? LV_SYMBOL_OK : " ", s_wifi_cache[idx]);
-        make_row(page, 46 + i * 36, cursor,
+                 current ? LV_SYMBOL_OK : " ", s_wifi_cache[i]);
+        make_row(page, 46 + i * 30, cursor,
                  cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
-    // 返回行:OK 即回菜单。
-    make_row(page, 46 + shown * 36, s_wifi_sel == s_wifi_cache_n,
+    // 返回行:索引 = count,OK 即回菜单。
+    make_row(page, 46 + s_wifi_cache_n * 30, s_wifi_sel == s_wifi_cache_n,
              LV_SYMBOL_LEFT, "返回");
 }
 
