@@ -279,39 +279,35 @@ static void rebuild_page(void)
 
 // ---------------------------------------------------------------- 数据刷新
 
-// 重置行:固定"重置 时间";团队套餐的点数窗口额外显示剩余(响应里有才显示)。
-static void set_reset_line(lv_obj_t *label, int64_t reset_ms, int remaining)
+// 重置行:"重置 时间"。
+static void set_reset_line(lv_obj_t *label, int64_t reset_ms)
 {
     char buf[16];
-    if (remaining >= 0) {
-        lv_label_set_text_fmt(label, "重置 %s · 余 %d",
-                              glm_usage_format_reset_ms(reset_ms, buf, sizeof(buf)), remaining);
-    } else {
-        lv_label_set_text_fmt(label, "重置 %s",
-                              glm_usage_format_reset_ms(reset_ms, buf, sizeof(buf)));
-    }
+    lv_label_set_text_fmt(label, "重置 %s",
+                          glm_usage_format_reset_ms(reset_ms, buf, sizeof(buf)));
 }
 
 static void update_usage_page(const glm_usage_t *u)
 {
     set_bar_pct(s_ui.week_bar, u->tokens_week_used_pct);
     set_pct_text(s_ui.week_pct, u->tokens_week_used_pct);
-    set_reset_line(s_ui.week_reset, u->tokens_week_reset_ms, u->tokens_week_remaining);
+    set_reset_line(s_ui.week_reset, u->tokens_week_reset_ms);
 
     set_bar_pct(s_ui.h5_bar, u->tokens_5h_used_pct);
     set_pct_text(s_ui.h5_pct, u->tokens_5h_used_pct);
-    set_reset_line(s_ui.h5_reset, u->tokens_5h_reset_ms, u->tokens_5h_remaining);
+    set_reset_line(s_ui.h5_reset, u->tokens_5h_reset_ms);
 
-    // 行 3:个人套餐显示 MCP 每月调用(已用/总量);团队套餐无 MCP 限制,
-    // 改显示本周剩余点数,进度条沿用本周已用百分比。
+    // 行 3:个人套餐显示 MCP 每月调用(已用/总量);团队套餐显示剩余重置次数
+    // (周 / 5 小时窗口各自还能重置几次,来自 customer-package-reset 接口)。
     if (u->mcp_total > 0) {
         lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
         lv_label_set_text_fmt(s_ui.mcp_val, "%d/%d", u->mcp_used, u->mcp_total);
         set_bar_pct(s_ui.mcp_bar, u->mcp_used * 100 / u->mcp_total);
-    } else if (u->tokens_week_remaining >= 0) {
-        lv_label_set_text(s_ui.mcp_label, "剩余点数");
-        lv_label_set_text_fmt(s_ui.mcp_val, "%d", u->tokens_week_remaining);
-        set_bar_pct(s_ui.mcp_bar, u->tokens_week_used_pct);
+    } else if (u->week_resets_left >= 0 && u->five_hour_resets_left >= 0) {
+        lv_label_set_text(s_ui.mcp_label, "剩余重置");
+        lv_label_set_text_fmt(s_ui.mcp_val, "周%d 5h%d",
+                              u->week_resets_left, u->five_hour_resets_left);
+        set_bar_pct(s_ui.mcp_bar, -1); // 次数没有百分比语义,条置空
     } else {
         lv_label_set_text(s_ui.mcp_label, "MCP 调用(每月)");
         lv_label_set_text(s_ui.mcp_val, "--");

@@ -90,18 +90,14 @@ static esp_err_t on_http_event(esp_http_client_event_t *evt)
 
 // 单次 HTTPS 请求。成功(HTTP 交互完成)返回 ESP_OK;http_status/body/body_len
 // 带出结果。认证头格式由 bearer 决定(先无前缀,401 后带 Bearer 重试一次)。
-// org/project 非空时走团队套餐接口:URL 追加 ?type=2 并带组织/项目请求头。
-static esp_err_t fetch_once(const char *api_key, bool bearer,
-                            const char *org, const char *project,
-                            int *http_status, char *body, size_t body_max,
-                            size_t *body_len)
+// org/project 非空时附带组织/项目请求头;url 为完整请求地址(配额与重置列表两个端点共用)。
+static esp_err_t fetch_url_once(const char *url, const char *api_key, bool bearer,
+                                const char *org, const char *project,
+                                int *http_status, char *body, size_t body_max,
+                                size_t *body_len)
 {
     char auth[APP_STORAGE_API_KEY_MAX + 16];
     snprintf(auth, sizeof(auth), bearer ? "Bearer %s" : "%s", api_key);
-
-    bool team = (org && org[0] && project && project[0]);
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s", GLM_API_BASE, team ? "?type=2" : "");
 
     body_ctx_t ctx = { .body = body, .max = body_max, .len = 0 };
     esp_http_client_config_t cfg = {
@@ -118,7 +114,7 @@ static esp_err_t fetch_once(const char *api_key, bool bearer,
     if (!client) return ESP_FAIL;
     esp_http_client_set_header(client, "Authorization", auth);
     esp_http_client_set_header(client, "Accept", "application/json");
-    if (team) {
+    if (org && org[0] && project && project[0]) {
         // 团队套餐上下文:两个头缺一不可(实测只带其一返回空 data)。
         esp_http_client_set_header(client, "bigmodel-organization", org);
         esp_http_client_set_header(client, "bigmodel-project", project);
@@ -254,11 +250,13 @@ static void glm_task(void *arg)
                 app_storage_load_project(project, sizeof(project))) {
                 team = true; // 组织/项目成对配置 → 团队套餐接口
             }
+            char quota_url[256];
+            snprintf(quota_url, sizeof(quota_url), "%s%s", GLM_API_BASE, team ? "?type=2" : "");
             int status = 0;
             size_t blen = 0;
-            esp_err_t err = fetch_once(key, false,
-                                       team ? org : NULL, team ? project : NULL,
-                                       &status, body, sizeof(body), &blen);
+            esp_err_t err = fetch_url_once(quota_url, key, false,
+                                           team ? org : NULL, team ? project : NULL,
+                                           &status, body, sizeof(body), &blen);
             glm_usage_t parsed = { 0 }; // 传输/状态失败时不进解析:全零可安全判 msg 是否有效
             glm_err_t report = GLM_ERR_NONE;
             if (err != ESP_OK) {
@@ -266,9 +264,9 @@ static void glm_task(void *arg)
                 report = GLM_ERR_HTTP;
             } else if (status == 401) {
                 // 主口径(无 Bearer)被拒时,试一次 Bearer 口径再定论。
-                err = fetch_once(key, true,
-                                 team ? org : NULL, team ? project : NULL,
-                                 &status, body, sizeof(body), &blen);
+                err = fetch_url_once(quota_url, key, true,
+                                     team ? org : NULL, team ? project : NULL,
+                                     &status, body, sizeof(body), &blen);
                 if (err != ESP_OK) report = GLM_ERR_HTTP;
                 else if (status == 401 || status == 403) report = GLM_ERR_AUTH;
             } else if (status == 401 || status == 403) {
@@ -287,6 +285,21 @@ static void glm_task(void *arg)
             }
             int diag = 0;
             if (report == GLM_ERR_HTTP) diag = (err != ESP_OK) ? (int)err : status;
+            // 团队模式:追加拉取"剩余重置次数"(独立端点;失败仅置 -1,不影响配额)。
+            if (report == GLM_ERR_NONE && team) {
+                static const char RESETS_URL[] =
+                    "https://open.bigmodel.cn/api/biz/customer-package-reset/list?targetType=TEAM";
+                static char rbody[2 * 1024]; // 记录数最多十几条,2KB 足够
+                int rstatus = 0;
+                size_t rlen = 0;
+                if (fetch_url_once(RESETS_URL, key, false, org, project,
+                                   &rstatus, rbody, sizeof(rbody), &rlen) == ESP_OK &&
+                    rstatus == 200) {
+                    glm_resets_parse(rbody, rlen,
+                                     &parsed.five_hour_resets_left,
+                                     &parsed.week_resets_left);
+                }
+            }
             // 业务失败(如"当前用户不存在coding plan")也把 parsed 发布出去:
             // 界面要用 msg 说明原因,条目数值保持解析结果即可。
             publish(parsed.msg[0] != '\0' ? &parsed : NULL, report, diag);

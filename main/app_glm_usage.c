@@ -23,6 +23,8 @@ bool glm_usage_parse(const char *body, size_t body_len, glm_usage_t *out)
     out->mcp_remaining = -1;
     out->tokens_5h_remaining = -1;
     out->tokens_week_remaining = -1;
+    out->five_hour_resets_left = -1;
+    out->week_resets_left = -1;
 
     // 响应体理论上以 NUL 结尾更省事,但 HTTP 分块时不能保证,这里复制一份补 NUL。
     // 典型响应 <1KB,堆开销可接受;C3 堆紧张时此处是单次、短生命周期的分配。
@@ -129,6 +131,49 @@ bool glm_usage_parse(const char *body, size_t body_len, glm_usage_t *out)
     cJSON_Delete(root);
     if (out->http_code >= 200 && out->http_code < 300) out->ok = true;
     return parsed;
+}
+
+bool glm_resets_parse(const char *body, size_t body_len,
+                      int *out_5h, int *out_week)
+{
+    if (out_5h) *out_5h = -1;
+    if (out_week) *out_week = -1;
+    if (!body || body_len == 0) return false;
+    char *text = malloc(body_len + 1);
+    if (!text) return false;
+    memcpy(text, body, body_len);
+    text[body_len] = '\0';
+    cJSON *root = cJSON_Parse(text);
+    free(text);
+    if (!root) return false;
+
+    cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    bool ok = false;
+    if (cJSON_IsObject(data)) {
+        ok = true; // data 对象存在即视为解析成功;缺数组以 -1 表示"未提供"
+        // available 可能缺省(视为 true,与控制台口径一致);仅显式 false 才排除。
+        static const char *pairs[][2] = {
+            { "fiveHourResets", "5h" },
+            { "weekResets", "week" },
+        };
+        for (size_t i = 0; i < 2; i++) {
+            cJSON *arr = cJSON_GetObjectItemCaseSensitive(data, pairs[i][0]);
+            int count = -1;
+            if (cJSON_IsArray(arr)) {
+                count = 0;
+                cJSON *it;
+                cJSON_ArrayForEach(it, arr) {
+                    cJSON *av = cJSON_GetObjectItemCaseSensitive(it, "available");
+                    if (!cJSON_IsBool(av) || cJSON_IsTrue(av)) count++;
+                }
+                ok = true;
+            }
+            if (i == 0 && out_5h) *out_5h = count;
+            if (i == 1 && out_week) *out_week = count;
+        }
+    }
+    cJSON_Delete(root);
+    return ok;
 }
 
 bool glm_customer_parse_projects(const char *body, size_t body_len,

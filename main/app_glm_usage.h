@@ -40,6 +40,10 @@ typedef struct {
     // 剩余点数单独带出供界面展示;-1 表示响应中没有。
     int tokens_5h_remaining;        // 5 小时窗口剩余点数
     int tokens_week_remaining;      // 本周剩余点数
+    // 重置次数(customer-package-reset/list,仅团队套餐):available 的重置
+    // 记录条数 = 额度还能重置的次数;-1 表示未获取。
+    int five_hour_resets_left;      // 5 小时窗口剩余重置次数
+    int week_resets_left;           // 本周剩余重置次数
 } glm_usage_t;
 
 // 把一段 HTTP 响应体解析为 glm_usage_t。
@@ -52,6 +56,12 @@ bool glm_usage_parse(const char *body, size_t body_len, glm_usage_t *out);
 // 粗判响应是否"密钥被拒绝":业务码 401/1001 或 HTTP 401(上层把 HTTP 状态码
 // 塞进 http_code 时也覆盖)。用于屏幕上把"查询失败"细化为"密钥无效"。
 bool glm_usage_is_auth_error(const glm_usage_t *u);
+
+// 解析 customer-package-reset/list 响应,统计可用重置次数:
+// fiveHourResets[]/weekResets[] 中 available==true 的条数。解析成功返回 true
+// 并写 out_5h/out_week(响应缺数组时写 -1);非 JSON 返回 false。纯函数。
+bool glm_resets_parse(const char *body, size_t body_len,
+                      int *out_5h, int *out_week);
 
 // 把 getCustomerInfo 响应(data 部分为 JSON)压缩成门户可用的项目清单:
 //   [{"orgName":"…","orgId":"org-…","projects":[{"name":"…","id":"proj_…"}]},…]

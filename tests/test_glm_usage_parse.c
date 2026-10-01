@@ -163,11 +163,40 @@ static void test_customer_projects(void)
     CHECK(!glm_customer_parse_projects("not json", 8, out, sizeof(out)));
 }
 
+// customer-package-reset/list 真实形状:available 计数(显式 false 排除,缺省算可用)。
+static void test_resets_parse(void)
+{
+    const char *body =
+        "{\"code\":200,\"msg\":\"操作成功\",\"data\":{"
+        "\"customerId\":123,\"targetType\":\"TEAM\","
+        "\"lastFiveHourResetTime\":null,\"lastWeekResetTime\":\"2026-09-20 23:02:43\","
+        "\"fiveHourResets\":["
+        "{\"recordId\":1,\"grantType\":\"DIRECT\",\"expireTime\":\"2026-10-18 20:25:45\",\"available\":true},"
+        "{\"recordId\":2,\"grantType\":\"DIRECT\",\"expireTime\":\"2026-10-28 11:00:44\",\"available\":true},"
+        "{\"recordId\":3,\"grantType\":\"DIRECT\",\"expireTime\":\"2026-10-28 11:00:44\",\"available\":false}"
+        "],"
+        "\"weekResets\":["
+        "{\"recordId\":4,\"grantType\":\"DIRECT\",\"expireTime\":\"2026-10-20 23:02:43\",\"available\":true}"
+        "]}}";
+    int h5 = -1, wk = -1;
+    CHECK(glm_resets_parse(body, strlen(body), &h5, &wk));
+    CHECK(h5 == 2); // 3 条里 1 条 available:false
+    CHECK(wk == 1);
+    CHECK(glm_resets_parse(body, strlen(body), NULL, NULL)); // 允许只统计不取值
+
+    // 缺数组 → -1;非 JSON → false。
+    const char *empty = "{\"code\":200,\"data\":{\"targetType\":\"TEAM\"}}";
+    CHECK(glm_resets_parse(empty, strlen(empty), &h5, &wk));
+    CHECK(h5 == -1 && wk == -1);
+    CHECK(!glm_resets_parse("nope", 4, &h5, &wk));
+}
+
 int main(void)
 {
     test_parse_ok();
     test_parse_credit_limit();
     test_customer_projects();
+    test_resets_parse();
     test_parse_order_swapped();
     test_parse_missing_reset();
     test_parse_auth_error();
