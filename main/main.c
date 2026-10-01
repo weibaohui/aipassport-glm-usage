@@ -135,12 +135,13 @@ void app_main(void)
         ESP_LOGE(TAG, "NVS 初始化失败:%s", esp_err_to_name(st_err));
     }
 
-    // 4) 无线栈:有已保存热点就自动回退连接;空配置直接进入配网模式。
+    // 4) 无线栈:有已保存热点就自动回退连接;配网统一从设置菜单进
+    //    (菜单 → 配网 → 开启),不再开机自动开门户。
     app_netlist_t list;
     if (!app_storage_load_netlist(&list)) {
         app_netlist_reset(&list);
     }
-    int net_err = app_net_init(&list, true);
+    int net_err = app_net_init(&list, false);
     if (net_err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi 初始化失败:%s — 无法联网,界面将显示等待状态",
                  esp_err_to_name(net_err));

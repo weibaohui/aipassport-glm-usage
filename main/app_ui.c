@@ -32,6 +32,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lvgl_port.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
@@ -62,6 +63,7 @@ typedef enum {
     UI_SUB_REFRESH,// 刷新周期
     UI_SUB_SOFF,   // 熄屏时间
     UI_SUB_WIFI,   // WiFi 管理
+    UI_SUB_PROV,   // 配网(热点开关与状态)
     UI_SUB_INFO,   // 设备信息
 } ui_state_t;
 
@@ -114,8 +116,9 @@ static const char *MENU_LBL[] = {
     LV_SYMBOL_BELL "  熄屏时间",
     LV_SYMBOL_WIFI "  WiFi 管理",
     LV_SYMBOL_LIST "  设备信息",
+    LV_SYMBOL_HOME "  配网",
 };
-#define MENU_N 4
+#define MENU_N 5
 
 // ---------------------------------------------------------------- 工具
 
@@ -333,7 +336,7 @@ static void build_menu(lv_obj_t *page)
 {
     for (int i = 0; i < MENU_N; i++) {
         bool cursor = (i == s_menu_sel);
-        lv_obj_t *row = make_row(page, 52 + i * 48, cursor, " ", MENU_LBL[i]);
+        lv_obj_t *row = make_row(page, 52 + i * 44, cursor, " ", MENU_LBL[i]);
         // 右侧箭头:提示"OK 进入"。
         lv_obj_t *arrow = lv_label_create(row);
         lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
@@ -347,7 +350,7 @@ static void build_menu(lv_obj_t *page)
     lv_obj_t *hint = lv_label_create(page);
     style_label(hint, &s_font16, COL_DIM);
     lv_label_set_text(hint, "OK 进入 · 长按返回");
-    lv_obj_set_pos(hint, 14, 254);
+    lv_obj_set_pos(hint, 14, 284);
 }
 
 // 子页选项列表:cursor 高亮光标;当前已存值行前带绿色 ✓。
@@ -359,7 +362,7 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
         bool is_current = (opts[i] == current);
         char text[40];
         snprintf(text, sizeof(text), "%s %s", is_current ? LV_SYMBOL_OK : " ", lbls[i]);
-        s_ui.rows[i] = make_row(page, 52 + i * 44, cursor,
+        s_ui.rows[i] = make_row(page, 50 + i * 40, cursor,
                                 cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
     s_ui.row_count = n;
@@ -367,7 +370,7 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
     lv_obj_t *hint = lv_label_create(page);
     style_label(hint, &s_font16, COL_DIM);
     lv_label_set_text(hint, "OK 保存 · 长按返回");
-    lv_obj_set_pos(hint, 14, 254);
+    lv_obj_set_pos(hint, 14, 298);
 }
 
 static void build_wifi_page(lv_obj_t *page)
@@ -409,6 +412,60 @@ static void build_wifi_page(lv_obj_t *page)
     style_label(hint, &s_font16, COL_DIM);
     lv_label_set_text(hint, s_wifi_cache_n ? "OK 连接 · 长按返回" : "长按返回");
     lv_obj_set_pos(hint, 14, 282);
+}
+
+// 配网子页:开关 + 热点名/管理地址/连接数。
+static void build_prov_page(lv_obj_t *page)
+{
+    app_net_status_t st;
+    app_net_get_status(&st);
+    int y = 56;
+
+    const struct { const char *k; char v[72]; } rows[] = {
+        { "状态", { 0 } },
+        { "热点", { 0 } },
+        { "管理页", { 0 } },
+        { "已连设备", { 0 } },
+        { "本机 IP", { 0 } },
+    };
+    snprintf((char *)rows[0].v, sizeof(rows[0].v), "%s",
+             st.portal_active ? "已开启" : "未开启");
+    snprintf((char *)rows[1].v, sizeof(rows[1].v), "%s", st.ap_ssid);
+    snprintf((char *)rows[2].v, sizeof(rows[2].v), "http://192.168.4.1");
+    // 已连设备数:STA 列表接口在所有配置下都有原型;查询失败显示 --。
+    wifi_sta_list_t sta_list;
+    int sta_n = -1;
+    if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) sta_n = (int)sta_list.num;
+    snprintf((char *)rows[3].v, sizeof(rows[3].v),
+             sta_n >= 0 ? "%d" : "--", sta_n);
+    snprintf((char *)rows[4].v, sizeof(rows[4].v), "%s",
+             st.ip[0] ? st.ip : "未连接");
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        lv_obj_t *k = lv_label_create(page);
+        style_label(k, &s_font16, COL_DIM);
+        lv_label_set_text(k, rows[i].k);
+        lv_obj_set_pos(k, 14, y);
+        lv_obj_t *v = lv_label_create(page);
+        style_label(v, &s_font16, COL_TEXT);
+        lv_obj_set_width(v, 140);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+        lv_label_set_text(v, rows[i].v);
+        lv_obj_set_pos(v, 96, y);
+        y += 30;
+    }
+
+    // 开关行:绿色高亮,OK 翻转。
+    bool cursor = true;
+    lv_obj_t *row = make_row(page, y + 6, cursor,
+                             cursor ? LV_SYMBOL_RIGHT : " ",
+                             st.portal_active ? "关闭配网" : "开启配网");
+    LV_UNUSED(row);
+
+    lv_obj_t *hint = lv_label_create(page);
+    style_label(hint, &s_font16, COL_DIM);
+    lv_label_set_text(hint, "OK 开/关 · 长按返回");
+    lv_obj_set_pos(hint, 14, 254);
 }
 
 static void build_info_page(lv_obj_t *page)
@@ -535,6 +592,10 @@ static void rebuild_page(void)
     case UI_SUB_WIFI:
         build_top_bar(s_ui.page, "WiFi 管理");
         build_wifi_page(s_ui.page);
+        break;
+    case UI_SUB_PROV:
+        build_top_bar(s_ui.page, "配网");
+        build_prov_page(s_ui.page);
         break;
     case UI_SUB_INFO:
         build_top_bar(s_ui.page, "设备信息");
@@ -798,11 +859,9 @@ void app_ui_on_key(int btn, int ev)
     switch (s_state) {
     case UI_MAIN:
         if (btn == (int)BSP_BTN_OK && ev == 3) {
-            // 长按 OK:联网进设置菜单;未联网进配网(保证首次/户外可用性)。
-            app_net_status_t st;
-            app_net_get_status(&st);
-            if (st.state == APP_NET_ONLINE) s_state = UI_MENU;
-            else do_portal = true;
+            // 长按 OK:一律进设置菜单。配网门户移到菜单条目(设备未配置时
+            // 开机仍自动开门户),连不上 WiFi 也能进菜单改设置/看信息。
+            s_state = UI_MENU;
             rebuild_page();
         } else if (btn == (int)BSP_BTN_OK && ev == 0) {
             do_sleep = true; // 单击 OK:手动熄屏;唤醒走最前面的分支
@@ -829,7 +888,8 @@ void app_ui_on_key(int btn, int ev)
             s_opt_sel = 0;
             s_state = (s_menu_sel == 0) ? UI_SUB_REFRESH
                     : (s_menu_sel == 1) ? UI_SUB_SOFF
-                    : (s_menu_sel == 2) ? UI_SUB_WIFI : UI_SUB_INFO;
+                    : (s_menu_sel == 2) ? UI_SUB_WIFI
+                    : (s_menu_sel == 3) ? UI_SUB_INFO : UI_SUB_PROV;
             rebuild_page();
         }
         break;
@@ -875,6 +935,21 @@ void app_ui_on_key(int btn, int ev)
             s_page = 1; // 网络页能看到连接进度
             rebuild_page();
             show_toast("正在连接,请稍候…");
+        }
+        break;
+
+    case UI_SUB_PROV:
+        if (ev == 3) {
+            s_state = UI_MENU;
+            rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
+            // 开/关配网:命令投递给网络任务;重建显示新状态,吐司确认。
+            app_net_status_t st;
+            app_net_get_status(&st);
+            if (st.portal_active) app_net_stop_portal();
+            else app_net_start_portal();
+            rebuild_page();
+            show_toast(st.portal_active ? "配网已关闭" : "配网已开启");
         }
         break;
 
