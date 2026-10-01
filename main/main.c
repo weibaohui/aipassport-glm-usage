@@ -52,14 +52,42 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 }
 
 // 按键事件消费任务:串行化处理,UI 内部再按需转发到网络/查询任务。
+//
+// 事件规整(button 组件一次物理动作会发多个事件):
+//   PRESS   丢弃 —— 应用只响应 CLICK/DOUBLE/LONG,PRESS 是游戏类即时响应用的,
+//           之前把它也映射成"单击"导致 OK 熄屏后被抬起事件立刻唤醒(实测踩坑);
+//   CLICK   → 0;DOUBLE → 2;LONG → 3。
+//   长按后紧跟的 CLICK 抑制 —— LONG 触发动作后,抬起时的 CLICK 不是新按键意图
+//   (比如长按 OK 进配网后不该再把屏幕熄掉),同键 500ms 内的 CLICK 直接吞掉。
 static void input_task(void *arg)
 {
     (void)arg;
     input_event_t input;
+    int suppress_btn = -1;          // 待抑制 CLICK 的键;-1=无
+    TickType_t suppress_until = 0;  // 抑制窗截止时刻
     for (;;) {
-        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) == pdTRUE) {
-            app_ui_on_key((int)input.btn, input.event == BSP_BTN_LONG ? 3 : 0);
+        if (xQueueReceive(s_input_queue, &input, portMAX_DELAY) != pdTRUE) continue;
+        if (input.event == BSP_BTN_PRESS) continue; // 见上:PRESS 全部丢弃
+
+        // 长按后的 CLICK 抑制窗检查。
+        if (input.event == BSP_BTN_CLICK && input.btn == suppress_btn &&
+            xTaskGetTickCount() < suppress_until) {
+            suppress_btn = -1;
+            continue;
         }
+
+        int ev;
+        switch (input.event) {
+        case BSP_BTN_LONG:  ev = 3; break;
+        case BSP_BTN_DOUBLE: ev = 2; break;
+        default:            ev = 0; break; // CLICK
+        }
+        if (input.event == BSP_BTN_LONG) {
+            // 记录抑制窗:同键的 CLICK 在长按后一个抖动周期内视为抬手残波。
+            suppress_btn = (int)input.btn;
+            suppress_until = xTaskGetTickCount() + pdMS_TO_TICKS(500);
+        }
+        app_ui_on_key((int)input.btn, ev);
     }
 }
 
