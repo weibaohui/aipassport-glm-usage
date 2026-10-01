@@ -25,20 +25,22 @@ CONFIG_LV_DEF_REFR_PERIOD=20
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 本 demo UI 简单,24KB 足够;若自建复杂界面出现绘制卡死/看门狗,调大此值。
+# 本应用 UI 简单(两页 label/bar),24KB 足够;若出现绘制卡死/看门狗,调大此值。
 CONFIG_LV_MEM_SIZE_KILOBYTES=24
+# 中文界面:UTF-8 编码 + 缺字占位(缺字必须可见,不得静默空白)。
+CONFIG_LV_TXT_ENC_UTF8=y
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
-# --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
-CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# --- 网络与 TLS ---
+# mbedTLS 证书包:校验 open.bigmodel.cn 证书链(随 IDF 内置根证书)。
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+# SNTP 对时(TLS 校验需要正确墙钟),两个服务器互备。
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+
+# --- Bluetooth ---
+# 本应用(GLM 用量宝)不使用 BLE,关闭以节省约 25KB 内部 RAM 给 WiFi+TLS。
+# 若要编译参考 demo_ble.c,请恢复以下 NimBLE 配置(见基线 git 历史)。
+# CONFIG_BT_ENABLED is not set

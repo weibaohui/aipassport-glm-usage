@@ -12,9 +12,32 @@ Keep each asset in the matching subdirectory and document its destination, namin
 
 Store reusable font files and generated font sources in `fonts/`.
 
+| File | Specs | Use and source |
+| --- | --- | --- |
+| [`fonts/glm_charset.txt`](fonts/glm_charset.txt) | Plain text, 3610 codepoints | Character set of the GLM usage-meter app: printable ASCII + common fullwidth punctuation + top 3500 hanzi by frequency (derived from [FrequencyWords zh_cn 50k](https://github.com/hermitdave/FrequencyWords)) + extra glyphs found in UI strings. Dynamic content (Wi-Fi SSIDs) beyond this subset falls back to placeholders. |
+| [`fonts/app_font_16.c`](fonts/app_font_16.c) | 16 px / 4 bpp / LVGL C source | App body font (Chinese + ASCII subset), compiled into the `main` component. Generated from `NotoSansSC-Regular.otf` with `lv_font_conv@1.5.3 --no-compress` over `glm_charset.txt`. |
+| [`fonts/app_font_24.c`](fonts/app_font_24.c) | 24 px / 4 bpp / LVGL C source | App title/percentage font, generated the same way. |
+| [`fonts/NotoSansSC-Regular.otf`](fonts/NotoSansSC-Regular.otf) | OpenType, SubsetOTF SC Regular | Source font for generation. [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) (SIL OFL 1.1, see [`fonts/OFL.txt`](fonts/OFL.txt)), sha256 `faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9`. |
+
 - Use descriptive names that include the family, weight, size, and format when relevant.
 - Document the source, license, character range, conversion command, and expected destination.
 - Check Flash and internal-RAM impact before adding a font; the ESP32-C3 has no PSRAM.
+  The two generated fonts add ~1.6MB of Flash (bitmap data) and no internal-RAM heap.
+- Regeneration command (run at the repository root, tool pinned to 1.5.3):
+
+  ```bash
+  npx lv_font_conv@1.5.3 \
+    --font assets/fonts/NotoSansSC-Regular.otf \
+    --size 16 --bpp 4 --format lvgl --no-compress \
+    --lv-font-name app_font_16 --lv-include lvgl.h \
+    --symbols "$(cat assets/fonts/glm_charset.txt)" \
+    --output assets/fonts/app_font_16.c
+  # use --size 24 to regenerate app_font_24.c
+  ```
+
+- Glyph coverage acceptance: static UI strings must be a subset of
+  `glm_charset.txt`; `tests/test_ui_charset.py` enforces this in the host gate.
+  Regenerate affected sizes whenever strings change.
 - Do not commit fonts whose license does not permit redistribution.
 
 ## Images

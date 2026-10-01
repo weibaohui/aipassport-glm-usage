@@ -10,9 +10,31 @@
 
 可复用的字库文件与生成的字库源码放在 `fonts/`。
 
+| 文件 | 规格 | 用途与来源 |
+| --- | --- | --- |
+| [`fonts/glm_charset.txt`](fonts/glm_charset.txt) | 纯文本,3610 个码点 | GLM 用量宝应用的字符清单:可打印 ASCII + 常用全角标点 + 汉字字频前 3500 字(来源 [FrequencyWords zh_cn 50k](https://github.com/hermitdave/FrequencyWords) 词频推导) + 文案缺字补遗。动态内容(Wi-Fi SSID 等)超出该子集时经 fallback 链显示占位符。 |
+| [`fonts/app_font_16.c`](fonts/app_font_16.c) | 16 px / 4 bpp / LVGL C 源码 | 应用正文字体(中文+ASCII 子集),编译进 `main` 组件。由 `NotoSansSC-Regular.otf` 经 `lv_font_conv@1.5.3 --no-compress` 生成,字符清单即 `glm_charset.txt`。 |
+| [`fonts/app_font_24.c`](fonts/app_font_24.c) | 24 px / 4 bpp / LVGL C 源码 | 应用标题/百分比字体,同上生成。 |
+| [`fonts/NotoSansSC-Regular.otf`](fonts/NotoSansSC-Regular.otf) | OpenType,SubsetOTF SC Regular | 生成用源字库。[Noto Sans CJK SC](https://github.com/notofonts/noto-cjk)(SIL OFL 1.1,见 [`fonts/OFL.txt`](fonts/OFL.txt)),sha256 `faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9`。 |
+
 - 命名要能反映字族、字重、字级与格式。
 - 记录来源、许可、字符范围、转换命令与目标放置路径。
-- 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。
+- 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。两个生成字体
+  合计约 1.6MB Flash(位图数据),不占内部 RAM 堆。
+- 再生成命令(仓库根目录运行,工具版本固定 1.5.3):
+
+  ```bash
+  npx lv_font_conv@1.5.3 \
+    --font assets/fonts/NotoSansSC-Regular.otf \
+    --size 16 --bpp 4 --format lvgl --no-compress \
+    --lv-font-name app_font_16 --lv-include lvgl.h \
+    --symbols "$(cat assets/fonts/glm_charset.txt)" \
+    --output assets/fonts/app_font_16.c
+  # --size 24 同理生成 app_font_24.c
+  ```
+
+- 字形覆盖验收:静态文案必须 ⊆ `glm_charset.txt`,由 `tests/test_ui_charset.py`
+  在 host 门禁中自动检查;文案变化后须重新生成受影响字号。
 - 不提交许可不允许分发的字库。
 
 ## 图片（images）

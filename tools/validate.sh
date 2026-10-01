@@ -29,6 +29,15 @@ run_static_checks() {
         -o "${test_dir}/test_ui_pixel_math"
     "${test_dir}/test_ui_pixel_math"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_app_netlist.c main/app_netlist.c \
+        -o "${test_dir}/test_app_netlist"
+    "${test_dir}/test_app_netlist"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Imain -Itests/thirdparty/cJSON \
+        tests/test_glm_usage_parse.c main/app_glm_usage.c tests/thirdparty/cJSON/cJSON.c \
+        -o "${test_dir}/test_glm_usage_parse"
+    "${test_dir}/test_glm_usage_parse"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_demo_navigation.c main/demo_navigation.c \
         -o "${test_dir}/test_demo_navigation"
     "${test_dir}/test_demo_navigation"
@@ -55,14 +64,23 @@ run_static_checks() {
         -o "${test_dir}/test_bsp_audio_recovery"
     "${test_dir}/test_bsp_audio_recovery"
     for demo in audio low_power ble wifi; do
+        # macOS 自带 ld 不认 GNU 的 --gc-sections,等价选项是 -dead_strip;
+        # Linux/CI 保持 GNU 写法。功能相同:未引用段在链接期被丢弃。
+        local gc_flag
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            gc_flag="-Wl,-dead_strip"
+        else
+            gc_flag="-Wl,--gc-sections"
+        fi
         "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
             -ffunction-sections -fdata-sections -Itests/demo_stubs -Imain \
-            "tests/test_demo_${demo}_runtime.c" -Wl,--gc-sections \
+            "tests/test_demo_${demo}_runtime.c" "${gc_flag}" \
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_ui_charset.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_archive_firmware.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_install_passport_skills.py
