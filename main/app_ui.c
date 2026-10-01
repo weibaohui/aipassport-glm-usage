@@ -48,6 +48,7 @@ static lv_font_t s_font24;
 
 typedef struct {
     lv_obj_t *page;         // 当前页容器
+    lv_obj_t *warn;         // 右上角网络告警图标(红色 ⚠,断网/重连中显示)
     lv_obj_t *battery;      // 右上角电量
     lv_obj_t *portal;       // 配网横幅(每页都有)
     // 用量页控件
@@ -142,6 +143,15 @@ static void build_top_bar(lv_obj_t *page, const char *title)
     style_label(s_ui.battery, &s_font16, COL_DIM);
     lv_obj_set_pos(s_ui.battery, 178, 16);
     lv_label_set_text(s_ui.battery, "--");
+
+    // 网络告警图标:LVGL 内置符号(Montserrat 自带字形,不依赖中文字库)。
+    // 断网/重连中显示红色 ⚠,恢复在线自动隐藏 —— 见 poll_timer_cb。
+    s_ui.warn = lv_label_create(page);
+    lv_obj_set_style_text_font(s_ui.warn, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_ui.warn, lv_color_hex(COL_BAD), 0);
+    lv_obj_set_pos(s_ui.warn, 158, 16);
+    lv_label_set_text(s_ui.warn, LV_SYMBOL_WARNING);
+    lv_obj_add_flag(s_ui.warn, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_portal_banner(lv_obj_t *page)
@@ -348,6 +358,13 @@ static void update_foot(const glm_usage_t *u, glm_err_t err, bool last_ok,
         return;
     }
 
+    // 断网优先于一切:曾成功过也一样,网络没了就该说网络(而不是旧倒计时)。
+    if (err == GLM_ERR_WAIT_NET) {
+        lv_label_set_text(s_ui.foot, "网络已断开,自动重连中…");
+        lv_obj_set_style_text_color(s_ui.foot, lv_color_hex(COL_BAD), 0);
+        return;
+    }
+
     // 正常:套餐 + 下轮倒计时 + 最近成功时间(未对时前显示等待文案)。
     // 周期是用户可配的(1~60 分钟),从 NVS 读,别写死。
     const char *plan = u->level[0] ? u->level : "--";
@@ -426,11 +443,18 @@ static void poll_timer_cb(lv_timer_t *timer)
     }
     s_pending_page = -1;
 
-    // 2) 电量:CW2017 寄存器读,代价低,每轮刷新。
+    // 2) 电量 + 网络告警:每轮取一次网络快照,两处共用。
+    app_net_status_t net;
+    app_net_get_status(&net);
     if (s_ui.battery) {
         int soc = bsp_battery_soc();
         if (soc >= 0) lv_label_set_text_fmt(s_ui.battery, "%d%%", soc);
         else lv_label_set_text(s_ui.battery, "--");
+    }
+    if (s_ui.warn) {
+        // 非在线即告警(连接中/扫描/重试/空闲未连);在线隐藏。
+        if (net.state != APP_NET_ONLINE) lv_obj_clear_flag(s_ui.warn, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_ui.warn, LV_OBJ_FLAG_HIDDEN);
     }
 
     // 3) 页面内容。
@@ -448,12 +472,10 @@ static void poll_timer_cb(lv_timer_t *timer)
 
     // 4) 配网横幅:仅在"AP 开着且未联网"时显示(联网后用户已不需要引导)。
     if (s_ui.portal) {
-        app_net_status_t st;
-        app_net_get_status(&st);
-        if (st.portal_active && st.state != APP_NET_ONLINE) {
+        if (net.portal_active && net.state != APP_NET_ONLINE) {
             lv_label_set_text_fmt(s_ui.portal,
                                   "配网中:连接热点 %s,电脑打开 192.168.4.1",
-                                  st.ap_ssid);
+                                  net.ap_ssid);
             lv_obj_clear_flag(s_ui.portal, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_ui.portal, LV_OBJ_FLAG_HIDDEN);

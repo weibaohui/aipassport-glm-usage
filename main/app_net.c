@@ -28,6 +28,7 @@ typedef enum {
     NET_CMD_PORTAL_ON,
     NET_CMD_PORTAL_OFF,
     NET_CMD_RELOAD_CONFIG, // 门户保存/删除热点后,重载 NVS 列表到任务副本
+    NET_CMD_STA_DROPPED,   // 预期在线时收到断开事件:清状态并立即重连
 } net_cmd_id_t;
 
 typedef struct {
@@ -52,7 +53,10 @@ static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static esp_event_handler_instance_t s_evt_any;
 static bool s_wifi_init;
-static volatile bool s_quit; // 预留:本应用常驻,暂无退出路径
+static volatile bool s_quit;        // 预留:本应用常驻,暂无退出路径
+static volatile bool s_expected_up; // 预期 STA 在线(connect 成功置位,断开/重连清零)。
+                                    // 断开事件只在预期在线时才算"意外掉线",否则会把
+                                    // 主动 disconnect/连接尝试中的失败误判成掉线。
 
 // ------------------------------------------------------------------ 状态发布
 
@@ -96,6 +100,13 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     case WIFI_EVENT_STA_DISCONNECTED:
         // 连接失败与掉线共用此事件;等待方按位区分超时/失败。
         xEventGroupSetBits(s_events, EV_STA_FAIL);
+        // 空闲期意外掉线:通知任务立刻清状态并按已存列表重连(路由器重启/
+        // 信号丢失等场景)。连接过程中的断开由 connect_one 自己消费,不进这里。
+        if (s_expected_up) {
+            s_expected_up = false;
+            net_msg_t m = { .id = NET_CMD_STA_DROPPED };
+            xQueueSend(s_queue, &m, 0);
+        }
         break;
     default:
         break;
@@ -139,6 +150,7 @@ static esp_err_t connect_one(const char *ssid, const char *pwd)
         }
         set_ip(ip);
         set_state(APP_NET_ONLINE);
+        s_expected_up = true;
         ESP_LOGI(TAG, "已连接 %s,IP %s", ssid, ip);
         return ESP_OK;
     }
@@ -147,7 +159,8 @@ static esp_err_t connect_one(const char *ssid, const char *pwd)
         return ESP_FAIL;
     }
     ESP_LOGW(TAG, "连接超时:%s", ssid);
-    esp_wifi_disconnect(); // 超时后停掉仍在进行的握手,避免残留状态
+    s_expected_up = false; // 主动断开,别让随后的 DISCONNECTED 事件误报掉线
+    esp_wifi_disconnect();
     return ESP_ERR_TIMEOUT;
 }
 
@@ -189,10 +202,7 @@ static void do_scan(void)
         ESP_LOGW(TAG, "扫描启动失败:%s", esp_err_to_name(err));
     }
     // 扫描不影响连接状态:若此前已在线,回到 ONLINE;否则回 IDLE。
-    portENTER_CRITICAL(&s_lock);
-    bool online = (s_status.ip[0] != '\0');
-    portEXIT_CRITICAL(&s_lock);
-    set_state(online ? APP_NET_ONLINE : APP_NET_IDLE);
+    set_state(s_expected_up ? APP_NET_ONLINE : APP_NET_IDLE);
 }
 
 // 整轮尝试已保存列表(点选优先)。全部失败返回 false。
@@ -308,6 +318,15 @@ static void net_task(void *arg)
             case NET_CMD_PORTAL_OFF:
                 portal_ap_stop();
                 break;
+            case NET_CMD_STA_DROPPED:
+                // 意外掉线:清陈旧 IP(界面不再显示假的已连接),立即重连。
+                set_ip("");
+                set_state(APP_NET_OFFLINE_RETRY);
+                if (!try_saved_round()) {
+                    set_state(APP_NET_OFFLINE_RETRY);
+                    last_retry = xTaskGetTickCount();
+                }
+                continue; // 掉线重连优先于下一轮等待
             case NET_CMD_RELOAD_CONFIG:
                 // 从 NVS 重载(门户刚写入),同步 has_config 供 UI/页面判断阶段。
                 if (app_storage_load_netlist(&s_list)) {
@@ -325,10 +344,27 @@ static void net_task(void *arg)
 
         // ---- 1 秒周期维护 ----
         portENTER_CRITICAL(&s_lock);
-        bool online = (s_status.ip[0] != '\0');
         bool portal = s_status.portal_active;
         int close_s = s_status.portal_close_s;
+        bool online = (s_status.state == APP_NET_ONLINE);
         portEXIT_CRITICAL(&s_lock);
+
+        // 在线探活:状态声称在线,但驱动报告未关联 → 事件可能丢帧(如休眠
+        // 期间),按掉线处理。esp_wifi_sta_get_ap_info 未关联时返回非 OK。
+        if (online) {
+            wifi_ap_record_t rec;
+            if (esp_wifi_sta_get_ap_info(&rec) != ESP_OK) {
+                s_expected_up = false;
+                set_ip("");
+                set_state(APP_NET_OFFLINE_RETRY);
+                ESP_LOGW(TAG, "探活失败:STA 已断开,开始自动重连");
+                if (!try_saved_round()) {
+                    set_state(APP_NET_OFFLINE_RETRY);
+                    last_retry = xTaskGetTickCount();
+                }
+                online = (s_status.state == APP_NET_ONLINE);
+            }
+        }
 
         // AP 自动关闭倒计时:任何路径连上网络(点选/自动回退)都应启动,
         // 否则配网横幅和热点会一直挂着(实测踩坑:自动连接路径漏了倒计时)。
@@ -346,14 +382,14 @@ static void net_task(void *arg)
             if (now == 0) portal_ap_stop();
         }
         // 掉线重试:整轮失败后每 RETRY_GAP_MS 再试一轮。
-        if (!online && s_list.count > 0 && !portal &&
+        if (!s_expected_up && !online && s_list.count > 0 && !portal &&
             (xTaskGetTickCount() - last_retry) >= pdMS_TO_TICKS(RETRY_GAP_MS)) {
             last_retry = xTaskGetTickCount();
             ESP_LOGI(TAG, "重试已保存热点…");
             if (try_saved_round()) continue;
             set_state(APP_NET_OFFLINE_RETRY);
         }
-        // 在线时刷新 RSSI 供 UI 展示。
+        // 在线时刷新 RSSI 供 UI 展示(探活成功后顺带读)。
         if (online) {
             wifi_ap_record_t rec;
             if (esp_wifi_sta_get_ap_info(&rec) == ESP_OK) {
