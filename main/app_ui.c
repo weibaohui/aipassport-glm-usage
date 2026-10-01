@@ -335,19 +335,6 @@ static void build_menu(lv_obj_t *page)
     }
     s_ui.row_count = MENU_N;
 
-    // 底部管理地址:联网时显示局域网访问入口(在线即可达,免开网页找 IP)。
-    app_net_status_t st;
-    app_net_get_status(&st);
-    lv_obj_t *url = lv_label_create(page);
-    style_label(url, &s_font16, COL_DIM);
-    lv_obj_set_width(url, 216);
-    lv_label_set_long_mode(url, LV_LABEL_LONG_DOT);
-    if (st.state == APP_NET_ONLINE && st.ip[0]) {
-        lv_label_set_text_fmt(url, "管理地址 http://%s", st.ip);
-    } else {
-        lv_label_set_text(url, "管理地址:联网后可用");
-    }
-    lv_obj_set_pos(url, 12, 292);
 }
 
 // 子页选项列表:cursor 高亮光标;当前已存值行前带绿色 ✓。
@@ -368,6 +355,10 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
     s_ui.row_count = n + 1;
 }
 
+// WiFi 页光标范围:0..count(最后一个索引是"返回"行)。超过 5 条时用
+// s_wifi_off 滚动窗口保证光标可见。
+static int s_wifi_off;
+
 static void build_wifi_page(lv_obj_t *page)
 {
     app_netlist_t list;
@@ -380,7 +371,8 @@ static void build_wifi_page(lv_obj_t *page)
             s_wifi_cache_n++;
         }
     }
-    if (s_wifi_sel >= s_wifi_cache_n) s_wifi_sel = s_wifi_cache_n - 1;
+    int total = s_wifi_cache_n + 1; // +1 = 返回行(索引 count)
+    if (s_wifi_sel >= total) s_wifi_sel = total - 1;
     if (s_wifi_sel < 0) s_wifi_sel = 0;
 
     if (s_wifi_cache_n == 0) {
@@ -389,24 +381,31 @@ static void build_wifi_page(lv_obj_t *page)
         lv_label_set_text(empty, "暂无已存热点\n可在网页配网时添加");
         lv_obj_set_pos(empty, 14, 70);
         s_ui.row_count = 0;
-    } else {
-        app_net_status_t st;
-        app_net_get_status(&st);
-        int shown = s_wifi_cache_n > 5 ? 5 : s_wifi_cache_n;
-        for (int i = 0; i < shown; i++) {
-            bool cursor = (i == s_wifi_sel);
-            bool current = (strcmp(st.cur_ssid, s_wifi_cache[i]) == 0);
-            char text[APP_NETLIST_SSID_MAX + 8];
-            snprintf(text, sizeof(text), "%s %s",
-                     current ? LV_SYMBOL_OK : " ", s_wifi_cache[i]);
-            make_row(page, 46 + i * 36, cursor,
-                     cursor ? LV_SYMBOL_RIGHT : " ", text);
-        }
-        // 返回行:OK 即回菜单。
-        make_row(page, 46 + shown * 36, s_wifi_sel >= shown,
-                 LV_SYMBOL_LEFT, "返回");
-        s_ui.row_count = shown + 1;
+        return;
     }
+
+    app_net_status_t st;
+    app_net_get_status(&st);
+    int shown = s_wifi_cache_n > 5 ? 5 : s_wifi_cache_n;
+    // 滚动窗口:让光标落在可见范围。
+    if (s_wifi_off > s_wifi_cache_n - shown) s_wifi_off = s_wifi_cache_n - shown;
+    if (s_wifi_off < 0) s_wifi_off = 0;
+    if (s_wifi_sel < s_wifi_off) s_wifi_off = s_wifi_sel;
+    if (s_wifi_sel >= s_wifi_off + shown) s_wifi_off = s_wifi_sel - shown + 1;
+
+    for (int i = 0; i < shown; i++) {
+        int idx = s_wifi_off + i;
+        bool cursor = (idx == s_wifi_sel);
+        bool current = (strcmp(st.cur_ssid, s_wifi_cache[idx]) == 0);
+        char text[APP_NETLIST_SSID_MAX + 8];
+        snprintf(text, sizeof(text), "%s %s",
+                 current ? LV_SYMBOL_OK : " ", s_wifi_cache[idx]);
+        make_row(page, 46 + i * 36, cursor,
+                 cursor ? LV_SYMBOL_RIGHT : " ", text);
+    }
+    // 返回行:OK 即回菜单。
+    make_row(page, 46 + shown * 36, s_wifi_sel == s_wifi_cache_n,
+             LV_SYMBOL_LEFT, "返回");
 }
 
 // 配网子页:开关 + 热点名/管理地址/连接数。
@@ -506,12 +505,14 @@ static void build_info_page(lv_obj_t *page)
         lv_label_set_text(k, rows[i].k);
         lv_obj_set_pos(k, 14, y);
 
+        bool is_url = (i == 1); // 管理地址行:纯 ASCII,用小一号 Montserrat 防换行
         lv_obj_t *v = lv_label_create(page);
-        style_label(v, &s_font16, COL_TEXT);
-        lv_obj_set_width(v, 140);
+        style_label(v, is_url ? &lv_font_montserrat_14 : &s_font16, COL_TEXT);
+        lv_obj_set_width(v, is_url ? 150 : 140);
+        lv_obj_set_height(v, 20); // 固定行高:LONG_DOT 截尾,绝不挤到下一行
         lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
         lv_label_set_text(v, rows[i].v);
-        lv_obj_set_pos(v, 92, y);
+        lv_obj_set_pos(v, is_url ? 86 : 92, y);
         y += 27;
     }
 
@@ -860,22 +861,30 @@ void app_ui_on_key(int btn, int ev)
         break;
     }
 
-    case UI_SUB_WIFI:
+    case UI_SUB_WIFI: {
+        int total = s_wifi_cache_n + 1; // 含返回行
         if (ev == 3) {
             s_state = UI_MENU;
             rebuild_page();
-        } else if (ev == 0 && btn == (int)BSP_BTN_UP && s_wifi_cache_n > 0) {
-            s_wifi_sel = (s_wifi_sel + s_wifi_cache_n - 1) % s_wifi_cache_n;
-            rebuild_page(); // 行内容含连接标记,重建最稳
-        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN && s_wifi_cache_n > 0) {
-            s_wifi_sel = (s_wifi_sel + 1) % s_wifi_cache_n;
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP && total > 1) {
+            s_wifi_sel = (s_wifi_sel + total - 1) % total;
+            rebuild_page(); // 行内容含连接标记与滚动窗口,重建最稳
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN && total > 1) {
+            s_wifi_sel = (s_wifi_sel + 1) % total;
             rebuild_page();
-        } else if (ev == 0 && btn == (int)BSP_BTN_OK && s_wifi_cache_n > 0) {
-            app_net_connect_ssid(s_wifi_cache[s_wifi_sel]);
-            rebuild_page(); // 重建后 ✓ 标记移到新连接项
-            show_toast("正在连接,请稍候…");
+        } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
+            if (s_wifi_sel == s_wifi_cache_n) {
+                // 返回行
+                s_state = UI_MENU;
+                rebuild_page();
+            } else if (s_wifi_cache_n > 0) {
+                app_net_connect_ssid(s_wifi_cache[s_wifi_sel]);
+                rebuild_page(); // 重建后 ✓ 标记移到新连接项
+                show_toast("正在连接,请稍候…");
+            }
         }
         break;
+    }
 
     case UI_SUB_PROV:
         if (ev == 3) {
