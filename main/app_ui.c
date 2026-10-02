@@ -5,7 +5,7 @@
 //
 // 状态机:
 //   UI_MAIN  主页面(用量页/网络页,UP/DOWN 切换)
-//   UI_MENU  设置菜单(任意状态长按 OK 进入;UP/DOWN 选择,OK 进子页)
+//   UI_MENU  设置菜单(下键单击进入;UP/DOWN 选择,OK 进子页)
 //   UI_SUB_* 设置子页(刷新周期/熄屏时间/WiFi 管理/设备信息)
 //
 // 线程模型(关键):
@@ -783,12 +783,9 @@ void app_ui_on_key(int btn, int ev)
 
     switch (s_state) {
     case UI_MAIN:
-        if (btn == (int)BSP_BTN_OK && ev == 3) {
-            // 长按 OK:一律进设置菜单。配网门户移到菜单条目(设备未配置时
-            // 开机仍自动开门户),连不上 WiFi 也能进菜单改设置/看信息。
-            s_state = UI_MENU;
-            rebuild_page();
-        } else if (btn == (int)BSP_BTN_OK && ev == 0) {
+        // 注意:菜单入口只有下键(单击)。OK 长按不做任何事 —— 避免与熄屏键
+        // 语义混淆(实测用户预期:下键=设置)。
+        if (btn == (int)BSP_BTN_OK && ev == 0) {
             do_sleep = true; // 单击 OK:手动熄屏;唤醒走最前面的分支
         } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
             do_refresh = true; // 用量页=手动刷新
