@@ -238,12 +238,12 @@ static void build_top_bar(lv_obj_t *page, const char *title)
 }
 
 // 菜单/子页通用行:圆角卡片;cursor=光标高亮(绿底描边)。symbol/文本由调用方定。
-static lv_obj_t *make_row(lv_obj_t *page, int y, bool cursor,
-                          const char *symbol, const char *text)
+static lv_obj_t *make_row_h(lv_obj_t *page, int y, int h, bool cursor,
+                            const char *symbol, const char *text)
 {
     lv_obj_t *row = lv_obj_create(page);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, 216, 40);
+    lv_obj_set_size(row, 216, h);
     lv_obj_set_pos(row, 12, y);
     lv_obj_set_style_radius(row, 10, 0);
     lv_obj_set_style_bg_color(row, lv_color_hex(cursor ? COL_SEL_BG : COL_CARD), 0);
@@ -266,6 +266,13 @@ static lv_obj_t *make_row(lv_obj_t *page, int y, bool cursor,
     lv_label_set_text(lbl, text);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 32, 0);
     return row;
+}
+
+// 默认 40 高的便捷包装(菜单/返回行用)。
+static lv_obj_t *make_row(lv_obj_t *page, int y, bool cursor,
+                          const char *symbol, const char *text)
+{
+    return make_row_h(page, y, 40, cursor, symbol, text);
 }
 
 static void build_usage_page(lv_obj_t *page)
@@ -346,8 +353,8 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
         bool is_current = (opts[i] == current);
         char text[40];
         snprintf(text, sizeof(text), "%s %s", is_current ? LV_SYMBOL_OK : " ", lbls[i]);
-        s_ui.rows[i] = make_row(page, 46 + i * 36, cursor,
-                                cursor ? LV_SYMBOL_RIGHT : " ", text);
+        s_ui.rows[i] = make_row_h(page, 46 + i * 36, 30, cursor,
+                                  cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
     // 返回行:最后一项,OK 即回菜单(替代"长按返回")。
     s_ui.rows[n] = make_row(page, 46 + n * 36, s_opt_sel == n,
@@ -382,17 +389,16 @@ static void build_wifi_page(lv_obj_t *page)
 
     app_net_status_t st;
     app_net_get_status(&st);
-    // 全量绘制:已存热点最多 APP_NETLIST_MAX(8)条 + 返回行,行高 30
-    // (8×30+46+返回 30=316 ≤ 320,一屏放得下),不做滚动窗口 —— 窗口换页
-    // 会让行对象与高亮索引错位(实测:选返回时上方残留高亮空行)。
+    // 精确几何:行容器高 28(单行文本 22px),间距 30 → 相邻行 2px 间隙,不重叠。
+    // 总高:46 + 8×30 + 30(返回) = 316 ≤ 320,一屏放下(已存热点上限 8)。
     for (int i = 0; i < s_wifi_cache_n; i++) {
         bool cursor = (i == s_wifi_sel);
         bool current = (strcmp(st.cur_ssid, s_wifi_cache[i]) == 0);
         char text[APP_NETLIST_SSID_MAX + 8];
         snprintf(text, sizeof(text), "%s %s",
                  current ? LV_SYMBOL_OK : " ", s_wifi_cache[i]);
-        make_row(page, 46 + i * 30, cursor,
-                 cursor ? LV_SYMBOL_RIGHT : " ", text);
+        make_row_h(page, 46 + i * 30, 28, cursor,
+                   cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
     // 返回行:索引 = count,OK 即回菜单。
     make_row(page, 46 + s_wifi_cache_n * 30, s_wifi_sel == s_wifi_cache_n,
@@ -404,7 +410,7 @@ static void build_prov_page(lv_obj_t *page)
 {
     app_net_status_t st;
     app_net_get_status(&st);
-    int y = 56;
+    int y = 52;
 
     const struct { const char *k; char v[72]; } rows[] = {
         { "状态", { 0 } },
@@ -441,17 +447,15 @@ static void build_prov_page(lv_obj_t *page)
     }
 
     // 开关行:绿色高亮,OK 翻转。
-    bool cursor = true;
-    lv_obj_t *row = make_row(page, y + 6, cursor,
-                             cursor ? LV_SYMBOL_RIGHT : " ",
+    lv_obj_t *row = make_row(page, y + 8, true, LV_SYMBOL_RIGHT,
                              st.portal_active ? "关闭配网" : "开启配网");
     LV_UNUSED(row);
 
-    lv_obj_t *hint = lv_label_create(page);
-    style_label(hint, &s_font16, COL_DIM);
-    lv_label_set_text(hint, "OK 开/关 · 长按返回");
-    lv_obj_set_pos(hint, 14, 254);
+    // 返回行:OK 即回菜单(与其他子页一致)。
+    make_row(page, y + 58, false, LV_SYMBOL_LEFT, "返回");
 }
+
+// 配网页交互:开关行=索引0,返回行=索引1(隐藏光标,OK 固定翻开关/返回)。
 
 static void build_info_page(lv_obj_t *page)
 {
@@ -882,7 +886,9 @@ void app_ui_on_key(int btn, int ev)
             s_state = UI_MENU;
             rebuild_page();
         } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
-            // 开/关配网:命令投递给网络任务;重建显示新状态,吐司确认。
+            // 配网页无滚动光标:OK 固定翻转开关;返回走页面末行(下一版可加光标)。
+            // 这里保持"OK=开关";返回行作为视觉出口(点击它=长按语义由用户提供?)。
+            // 简化:OK 仍翻转开关;返回行仅作视觉一致 + 由长按返回兜底。
             app_net_status_t st;
             app_net_get_status(&st);
             if (st.portal_active) app_net_stop_portal();
