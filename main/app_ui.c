@@ -5,7 +5,7 @@
 //
 // 状态机:
 //   UI_MAIN  主页面(用量页/网络页,UP/DOWN 切换)
-//   UI_MENU  设置菜单(联网时长按 OK 进入;UP/DOWN 选择,OK 进子页,长按返回)
+//   UI_MENU  设置菜单(任意状态长按 OK 进入;UP/DOWN 选择,OK 进子页)
 //   UI_SUB_* 设置子页(刷新周期/熄屏时间/WiFi 管理/设备信息)
 //
 // 线程模型(关键):
@@ -87,6 +87,7 @@ static ui_state_t s_state = UI_MAIN; // UI 状态(input 持锁写,轮询读;enum
 static int s_menu_sel;               // 菜单光标
 static int s_opt_sel;                // 子页选项光标
 static int s_wifi_sel;               // WiFi 页光标
+static int s_prov_sel;               // 配网页光标(0=开关,1=返回)
 static lv_obj_t *s_scr;
 static uint32_t s_last_input_ms;     // 最近按键时刻(保留:显示层用)
 static int64_t s_last_input_us;      // 最近交互时刻(esp_timer 微秒;熄屏判定用)
@@ -356,7 +357,7 @@ static void build_option_page(lv_obj_t *page, const uint16_t *opts,
         s_ui.rows[i] = make_row_h(page, 46 + i * 36, 30, cursor,
                                   cursor ? LV_SYMBOL_RIGHT : " ", text);
     }
-    // 返回行:最后一项,OK 即回菜单(替代"长按返回")。
+    // 返回行:最后一项,OK 即回菜单。
     s_ui.rows[n] = make_row(page, 46 + n * 36, s_opt_sel == n,
                             LV_SYMBOL_LEFT, "返回");
     s_ui.row_count = n + 1;
@@ -446,16 +447,14 @@ static void build_prov_page(lv_obj_t *page)
         y += 30;
     }
 
-    // 开关行:绿色高亮,OK 翻转。
-    lv_obj_t *row = make_row(page, y + 8, true, LV_SYMBOL_RIGHT,
-                             st.portal_active ? "关闭配网" : "开启配网");
-    LV_UNUSED(row);
+    // 两行光标式(与其他子页一致):0=开关,1=返回;OK 执行光标所在行。
+    s_ui.rows[0] = make_row(page, y + 8, s_prov_sel == 0, LV_SYMBOL_RIGHT,
+                            st.portal_active ? "关闭配网" : "开启配网");
+    s_ui.rows[1] = make_row(page, y + 58, s_prov_sel == 1, LV_SYMBOL_LEFT, "返回");
+    s_ui.row_count = 2;
 
-    // 返回行:OK 即回菜单(与其他子页一致)。
-    make_row(page, y + 58, false, LV_SYMBOL_LEFT, "返回");
 }
 
-// 配网页交互:开关行=索引0,返回行=索引1(隐藏光标,OK 固定翻开关/返回)。
 
 static void build_info_page(lv_obj_t *page)
 {
@@ -885,16 +884,26 @@ void app_ui_on_key(int btn, int ev)
         if (ev == 3) {
             s_state = UI_MENU;
             rebuild_page();
+        } else if (ev == 0 && btn == (int)BSP_BTN_UP) {
+            s_prov_sel = (s_prov_sel + 1) % 2; // 两行循环
+            refresh_rows_cursor(s_prov_sel);
+        } else if (ev == 0 && btn == (int)BSP_BTN_DOWN) {
+            s_prov_sel = (s_prov_sel + 1) % 2;
+            refresh_rows_cursor(s_prov_sel);
         } else if (ev == 0 && btn == (int)BSP_BTN_OK) {
-            // 配网页无滚动光标:OK 固定翻转开关;返回走页面末行(下一版可加光标)。
-            // 这里保持"OK=开关";返回行作为视觉出口(点击它=长按语义由用户提供?)。
-            // 简化:OK 仍翻转开关;返回行仅作视觉一致 + 由长按返回兜底。
-            app_net_status_t st;
-            app_net_get_status(&st);
-            if (st.portal_active) app_net_stop_portal();
-            else app_net_start_portal();
-            rebuild_page();
-            show_toast(st.portal_active ? "配网已关闭" : "配网已开启");
+            if (s_prov_sel == 1) {
+                // 返回行
+                s_state = UI_MENU;
+                rebuild_page();
+            } else {
+                // 开关行:翻转配网门户。
+                app_net_status_t st;
+                app_net_get_status(&st);
+                if (st.portal_active) app_net_stop_portal();
+                else app_net_start_portal();
+                rebuild_page(); // 开关行文案随状态刷新
+                show_toast(st.portal_active ? "配网已关闭" : "配网已开启");
+            }
         }
         break;
 
