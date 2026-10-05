@@ -10,6 +10,10 @@
 #include "app_glm_client.h"
 #include "esp_err.h"
 
+// 最近一次 glm_discover 的原始清单(供 set_glm_team 按编号引用;RAM 缓存,
+// 重启即失,再 discover 一次即可)。放不下完整清单时不缓存,编号不可用。
+static char s_disc_cache[1536];
+
 // Key 掩码(abcd…wxyz;不足 8 位只显示前 2 位)。
 static void key_mask(char *out, size_t cap)
 {
@@ -46,10 +50,57 @@ static int tool_set_glm_key(cJSON *args, appfw_mcp_resp_t *resp)
 
 static int tool_set_glm_team(cJSON *args, appfw_mcp_resp_t *resp)
 {
-    const cJSON *o = cJSON_GetObjectItemCaseSensitive(args, "org");
-    const cJSON *p = cJSON_GetObjectItemCaseSensitive(args, "project");
-    const char *org = (cJSON_IsString(o) && o->valuestring) ? o->valuestring : "";
-    const char *proj = (cJSON_IsString(p) && p->valuestring) ? p->valuestring : "";
+    char org[64] = { 0 }, proj[64] = { 0 };
+    const cJSON *oi = cJSON_GetObjectItemCaseSensitive(args, "org_index");
+    if (cJSON_IsNumber(oi)) {
+        // 编号引用:取最近一次 glm_discover 清单的第 N 个组织(第 M 个项目,默认 1)。
+        if (!s_disc_cache[0]) {
+            appfw_mcp_resp_addf(resp, "没有可引用的发现清单:先调 glm_discover,或直接给 org/project ID");
+            return 1;
+        }
+        cJSON *list = cJSON_Parse(s_disc_cache);
+        if (!list) {
+            appfw_mcp_resp_addf(resp, "发现清单缓存损坏,请重新 glm_discover");
+            return 1;
+        }
+        const cJSON *o = NULL;
+        int idx = oi->valueint - 1, cnt = 0;
+        const cJSON *found_org = NULL, *found_proj = NULL;
+        cJSON_ArrayForEach(o, list) {
+            if (cnt++ == idx) { found_org = o; break; }
+        }
+        int pidx = 0;
+        const cJSON *pi = cJSON_GetObjectItemCaseSensitive(args, "project_index");
+        if (cJSON_IsNumber(pi)) pidx = pi->valueint - 1;
+        if (found_org) {
+            const cJSON *projects = cJSON_GetObjectItemCaseSensitive(found_org, "projects");
+            const cJSON *pj = NULL;
+            int pc = 0;
+            cJSON_ArrayForEach(pj, projects) {
+                if (pc++ == pidx) { found_proj = pj; break; }
+            }
+        }
+        // 先取字符串再删树:found_org/found_proj 指向树内节点,先删后读是 UAF
+        // (读到释放内存,表现为永远"编号越界",真机连踩两次)。
+        const cJSON *id = found_org ? cJSON_GetObjectItemCaseSensitive(found_org, "orgId") : NULL;
+        const cJSON *pid = found_proj ? cJSON_GetObjectItemCaseSensitive(found_proj, "id") : NULL;
+        if (!cJSON_IsString(id) || !id->valuestring[0] || !cJSON_IsString(pid) ||
+            !pid->valuestring[0]) {
+            appfw_mcp_resp_addf(resp,
+                "编号越界:清单里没有第 %d 个组织或其第 %d 个项目(缓存 %u 字节,前缀 %.80s)",
+                idx + 1, pidx + 1, (unsigned)strlen(s_disc_cache), s_disc_cache);
+            cJSON_Delete(list);
+            return 1;
+        }
+        strlcpy(org, id->valuestring, sizeof(org));
+        strlcpy(proj, pid->valuestring, sizeof(proj));
+        cJSON_Delete(list);
+    } else {
+        const cJSON *o = cJSON_GetObjectItemCaseSensitive(args, "org");
+        const cJSON *p = cJSON_GetObjectItemCaseSensitive(args, "project");
+        if (o && cJSON_IsString(o)) strlcpy(org, o->valuestring, sizeof(org));
+        if (p && cJSON_IsString(p)) strlcpy(proj, p->valuestring, sizeof(proj));
+    }
     if (strlen(org) >= 64 || strlen(proj) >= 64) {
         appfw_mcp_resp_addf(resp, "org/project 过长(≤63 字符)");
         return 1;
@@ -73,6 +124,40 @@ static int tool_set_glm_team(cJSON *args, appfw_mcp_resp_t *resp)
     return 0;
 }
 
+// 把原始发现结果压缩成 {orgId,orgName,projects:[{id,name}]} 存入缓存 ——
+// 原始响应含头像等大字段(6KB 级),直接存必然超缓存上限。
+static void disc_cache_store(const char *raw)
+{
+    cJSON *list = cJSON_Parse(raw);
+    if (!list) { s_disc_cache[0] = '\0'; return; }
+    cJSON *compact = cJSON_CreateArray();
+    const cJSON *o;
+    cJSON_ArrayForEach(o, list) {
+        cJSON *co = cJSON_CreateObject();
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "orgId");
+        const cJSON *nm = cJSON_GetObjectItemCaseSensitive(o, "orgName");
+        cJSON_AddStringToObject(co, "orgId", cJSON_IsString(id) ? id->valuestring : "");
+        if (cJSON_IsString(nm)) cJSON_AddStringToObject(co, "orgName", nm->valuestring);
+        cJSON *cps = cJSON_AddArrayToObject(co, "projects");
+        const cJSON *pj;
+        cJSON_ArrayForEach(pj, cJSON_GetObjectItemCaseSensitive(o, "projects")) {
+            cJSON *cp = cJSON_CreateObject();
+            const cJSON *pid = cJSON_GetObjectItemCaseSensitive(pj, "id");
+            const cJSON *pnm = cJSON_GetObjectItemCaseSensitive(pj, "name");
+            cJSON_AddStringToObject(cp, "id", cJSON_IsString(pid) ? pid->valuestring : "");
+            if (cJSON_IsString(pnm)) cJSON_AddStringToObject(cp, "name", pnm->valuestring);
+            cJSON_AddItemToArray(cps, cp);
+        }
+        cJSON_AddItemToArray(compact, co);
+    }
+    char *s = cJSON_PrintUnformatted(compact);
+    if (s && strlen(s) < sizeof(s_disc_cache)) strlcpy(s_disc_cache, s, sizeof(s_disc_cache));
+    else s_disc_cache[0] = '\0';
+    cJSON_free(s);
+    cJSON_Delete(list);
+    cJSON_Delete(compact);
+}
+
 static int tool_glm_discover(cJSON *args, appfw_mcp_resp_t *resp)
 {
     // 发现要拿网页 Token 调控制台接口,设备必须已联网。
@@ -93,6 +178,7 @@ static int tool_glm_discover(cJSON *args, appfw_mcp_resp_t *resp)
         return 1;
     }
     const int rc = app_glm_client_discover_projects(j->valuestring, out, 2048);
+    if (rc == ESP_OK) disc_cache_store(out);
     if (rc == 1) {
         free(out);
         appfw_mcp_resp_addf(resp, "登录 Token 已过期,请在浏览器重新复制");
@@ -203,8 +289,8 @@ static const appfw_mcp_tool_t GLM_TOOLS[] = {
     { "set_glm_key", "保存智谱 API Key(保存即生效,设备数秒内开始查询用量)",
       "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}",
       tool_set_glm_key },
-    { "set_glm_team", "设置团队套餐上下文(组织/项目 ID,成对配置;先 glm_discover 获取)",
-      "{\"type\":\"object\",\"properties\":{\"org\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"}},\"required\":[\"org\",\"project\"]}",
+    { "set_glm_team", "设置团队套餐上下文:给 org+project ID,或给 org_index(引用最近一次 glm_discover 清单的编号,project_index 默认 1)",
+      "{\"type\":\"object\",\"properties\":{\"org\":{\"type\":\"string\"},\"project\":{\"type\":\"string\"},\"org_index\":{\"type\":\"integer\"},\"project_index\":{\"type\":\"integer\"}},\"anyOf\":[{\"required\":[\"org\",\"project\"]},{\"required\":[\"org_index\"]}]}",
       tool_set_glm_team },
     { "glm_discover", "用 bigmodel.cn 网页登录 Token 换取组织/项目清单(Token 不存储;设备需已联网)",
       "{\"type\":\"object\",\"properties\":{\"jwt\":{\"type\":\"string\"}},\"required\":[\"jwt\"]}",
