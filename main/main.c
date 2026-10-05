@@ -132,7 +132,8 @@ void app_main(void)
         .home_up    = app_home_refresh_now,   // 上键:立即刷新
         .config_rows = app_home_config_rows,
         .menu_show_mask = APP_MENU_SHOW_MASK,
-        // 内置菜单默认入口:下键进设置菜单(与旧版交互一致)。
+        // 长按 OK = 设置菜单(用户定稿);下键单击仍是默认入口。
+        .long_press_ok = APPFW_LONG_PRESS_OPEN_MENU,
         .menu_open_btn = 0,
         .page_reset = app_home_page_reset,
     };

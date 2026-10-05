@@ -12,7 +12,6 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
-#include "esp_sntp.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -130,31 +129,23 @@ static esp_err_t fetch_url_once(const char *url, const char *api_key, bool beare
     return err;
 }
 
-// SNTP:一次初始化,反复等同步。服务器用阿里云 NTP(国内可达性最好)。
+// 对时:框架在拿到 IP 时启动 SNTP,这里只保留"已同步"标志供幂等判断。
 static bool s_time_synced;
-static void time_sync_cb(struct timeval *tv)
-{
-    (void)tv;
-    s_time_synced = true;
-}
 
 static bool ensure_time_synced(void)
 {
     if (s_time_synced) return true;
-    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "ntp.aliyun.com");
-    esp_sntp_setservername(1, "ntp.tencent.com");
-    esp_sntp_set_time_sync_notification_cb(time_sync_cb);
-    esp_sntp_init();
-    for (int i = 0; i < 30 && !s_time_synced; i++) {
+    // 对时由框架负责(appfw_net 在拿到 IP 时启动 SNTP);这里只等墙钟变 sane。
+    // 旧版在这里再 init 一次 SNTP,与框架的运行中实例相撞,sntp 断言炸重启
+    // (联网后必现,真机抓的 panic)。TLS 之前只认 time() 是否已同步。
+    for (int i = 0; i < 30; i++) {
+        if ((int64_t)time(NULL) > 1000000000LL) { // 早于 2001 年视为未对时
+            s_time_synced = true;
+            return true;
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    if (!s_time_synced) {
-        esp_sntp_stop();
-        return false;
-    }
-    return true;
+    return false;
 }
 
 // 网页端控制台域名(注意:用量查询走 open.bigmodel.cn,客户信息走主站)。
