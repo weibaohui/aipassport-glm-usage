@@ -25,6 +25,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "app_glm_mcp.h"
 #include "app_home.h"
 #include "app_portal_glm.h"
 
@@ -117,7 +118,9 @@ void app_main(void)
         ESP_LOGE(TAG, "按键初始化失败");
     }
 
-    // 7) AI 管理(MCP 常驻服务):框架基础工具跟随菜单使能位。
+    // 7) AI 管理(MCP 常驻服务):应用工具(GLM 配置/用量)+ 框架基础工具
+    //    (跟随菜单使能位)。配好 WiFi 后,Key/团队/用量全交给 AI。
+    glm_mcp_init();
     appfw_mcp_set_builtin_tools(APP_MENU_SHOW_MASK);
     appfw_mcp_server_start();
 

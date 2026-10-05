@@ -12,6 +12,7 @@ idf_component_register(
          "app_storage.c"
          "app_home.c"
          "app_portal_glm.c"
+         "app_glm_mcp.c"
     INCLUDE_DIRS "."
     REQUIRES appfw bsp esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
              json esp_http_client esp-tls esp_http_server lwip app_update
