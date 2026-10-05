@@ -10,7 +10,7 @@ Built as a second-development application on the upstream `ai-passport` BSP. The
 
 ## Features
 
-- **Provisioning portal** — with no saved config the device opens a hotspot (`GLM-Meter-XXXX`, gateway `192.168.4.1`) with a captive portal. Phase 1 (offline): scan and save multiple Wi-Fi networks with per-network passwords; the device auto-connects and falls back through the list. Phase 2 (online, via the LAN address shown on screen): API key, team context, refresh period, screen-off timeout, network management.
+- **Provisioning portal** — fully manual: Settings → Provisioning → Open hotspot. The device leaves its current network and enters dedicated hotspot mode (`GLM-Meter-XXXX`, gateway `192.168.4.1`); join it from your phone and the portal opens automatically: scan and save multiple Wi-Fi networks with per-network passwords, then tap "Save & connect" — the hotspot closes and the device goes online. To change settings later, open the hotspot again.
 - **GLM quota on screen** — usage page shows weekly quota, 5-hour window and MCP monthly calls (personal plans) or remaining credits (team plans), with progress bars, reset times and plan level. Refreshes every 1–60 minutes (configurable).
 - **Team plan support** — team quotas use the `type=2` endpoint with organization/project headers. Paste a one-shot web login token in the portal to auto-discover your organizations/projects (the token is used once and never stored).
 - **Auto screen-off** — configurable idle timeout (1–30 min or never): backlight off, LVGL stopped, ST7789 put to sleep (µA-level). Any key wakes the screen; usage polling keeps running in the background.
@@ -19,14 +19,39 @@ Built as a second-development application on the upstream `ai-passport` BSP. The
 
 ## Keys
 
-| Key | Action (screen on) | Action (screen off) |
+| Key | Screen on | Screen off |
 | --- | --- | --- |
-| UP | refresh now (usage page) / back to usage page | wake |
-| DOWN | open network page | wake |
-| OK click | screen off | wake |
-| OK long-press | open provisioning portal | wake |
+| UP | refresh usage now | wake |
+| DOWN | open settings menu | wake |
+| OK single | screen off | wake |
+| OK long-press | open settings menu | wake |
+
+The settings menu contains: refresh period, screen-off, Wi-Fi manager, device
+info (API key / plan status), provisioning, AI admin address, brightness.
 
 The device is never unreachable: after the provisioning hotspot closes, the network page shows the current management URL (`http://<LAN-IP>`).
+
+- **AI management (MCP)** — the device runs an always-on MCP service (`http://DEVICE-IP:8080/mcp`): once Wi-Fi is provisioned, the API key, team plan, usage queries, refresh period, screen-off and brightness are all just conversation with your AI; the web portal is the fallback.
+
+## Configure it with AI (MCP)
+
+Add `http://DEVICE-IP:8080/mcp` to any MCP-capable AI client (IP on screen under
+Settings → Device info). After Wi-Fi provisioning, everything is a conversation:
+
+| Tool | Purpose |
+| --- | --- |
+| `set_glm_key` | save the Zhipu API key (effective immediately) |
+| `glm_discover` | exchange a web login token for your org/project list (token never stored) |
+| `set_glm_team` | save team context (supports index-based pick from the discover list) |
+| `glm_usage` | current usage plus key/plan status |
+| `clear_glm` | clear key and team context |
+| `set_refresh_period` | usage refresh period (seconds) |
+| `set_screen_off` / `set_brightness` | screen-off timeout / brightness |
+| `wifi_status` / `wifi_connect_saved` | Wi-Fi status and switching |
+
+Typical flow: provision Wi-Fi (keys above) → tell the AI "configure key: xxx" →
+usage appears on screen within seconds; for team plans, also paste the web
+login token and let the AI discover and save your org/project.
 
 ## BigModel endpoints used
 
