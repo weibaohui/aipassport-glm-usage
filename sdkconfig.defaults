@@ -44,3 +44,6 @@ CONFIG_LWIP_SNTP_MAX_SERVERS=2
 # 本应用(GLM 用量宝)不使用 BLE,关闭以节省约 25KB 内部 RAM 给 WiFi+TLS。
 # 若要编译参考 demo_ble.c,请恢复以下 NimBLE 配置(见基线 git 历史)。
 # CONFIG_BT_ENABLED is not set
+
+# --- 配网二维码(配网页展示 WiFi/管理地址二维码) ---
+CONFIG_LV_USE_QRCODE=y

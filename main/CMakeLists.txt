@@ -1,20 +1,19 @@
-# GLM 用量宝 应用组件。
+# GLM 用量宝 应用组件(挂在 aipassport-fw 框架之上)。
 #
-# 基线 demo 源文件(demo_*.c / ui_pixel*.c)保留在仓库中作为参考实现,但不再
-# 编入本应用固件:二次开发应用必须自带重新设计的 UI(app_ui.c),且本应用不用
-# BLE —— 不编 demo_ble.c 才能从 REQUIRES 中去掉 bt,为 TLS+WiFi 省出内部 RAM。
-# host 测试直接编译这些文件,不经过本 CMakeLists,不受影响。
+# 通用能力(WiFi/门户/存储/UI 骨架/熄屏/按键/BSP/MCP)全部来自框架 appfw;
+# 本组件只保留业务:GLM 套餐用量查询与展示、Key/团队上下文存储与门户注入。
+# 旧的自研 app_net/app_netlist/app_portal/app_ui 已由框架取代(见
+# docs/migration-to-framework.zh_CN.md),demo_*.c/ui_pixel*.c 仅为基线参考,
+# 不编入固件。
 idf_component_register(
     SRCS "main.c"
          "app_glm_usage.c"
-         "app_netlist.c"
-         "app_storage.c"
-         "app_net.c"
-         "app_portal.c"
          "app_glm_client.c"
-         "app_ui.c"
+         "app_storage.c"
+         "app_home.c"
+         "app_portal_glm.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
+    REQUIRES appfw bsp esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash
              json esp_http_client esp-tls esp_http_server lwip app_update
 )
 

@@ -6,8 +6,9 @@
 #include <time.h>
 
 #include "app_glm_usage.h"
-#include "app_net.h"
+#include "appfw_net.h"
 #include "app_storage.h"
+#include "appfw_storage.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -213,11 +214,11 @@ static void glm_task(void *arg)
 
     for (;;) {
         // 1) 等联网(最多一个周期,再不行就发布等待态并重试)。
-        app_net_status_t st;
+        appfw_net_status_t st;
         bool online = false;
         for (int i = 0; i < 30; i++) {
-            app_net_get_status(&st);
-            if (st.state == APP_NET_ONLINE) { online = true; break; }
+            appfw_net_get_status(&st);
+            if (st.state == APPFW_NET_ONLINE) { online = true; break; }
             vTaskDelay(pdMS_TO_TICKS(2000));
             EventBits_t bits = xEventGroupGetBits(s_events);
             if (bits & EV_REFRESH) break;
@@ -234,7 +235,7 @@ static void glm_task(void *arg)
 
         // 3) 读当前刷新周期(门户可改,即改即生效)。
         uint16_t period_s = GLM_API_PERIOD_S;
-        app_storage_load_period(&period_s);
+        appfw_store_get_period(&period_s);
 
         // 4) 读当前 API Key 与团队上下文(门户可能随时改),请求用量。
         if (online) {
